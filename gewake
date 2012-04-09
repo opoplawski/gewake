@@ -1,0 +1,281 @@
+#!/usr/bin/perl -w
+#
+# gewake - monitor grid engine and wake up hosts if needed
+#
+# Copyright (C) 2012 Orion Poplawski <orion@cora.nwra.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+use Getopt::Std;
+use Date::Manip;
+
+# Convert units into raw sizes
+sub memValue {
+   my ($arg) = @_;
+
+   $arg =~ s/([KMG])//;
+   return $arg if !defined($1);
+   if ($1 eq "K") {
+      $arg *= 1024;
+   } elsif ($1 eq "M") {
+      $arg *= 1024*1024;
+   } elsif ($1 eq "G") {
+      $arg *= 1024*1024*1024;
+   }
+   return $arg;
+}
+
+my $version = "1.0";
+my $wakehostsfile = "/usr/local/etc/gewake.hosts";
+my $wakeupcmd = "/usr/local/bin/wakeup";
+my $usage = <<EOU;
+Usage: gewake [-d]
+
+ -d Turns on debugging output
+EOU
+
+getopts("d",\%opts) || die $usage;
+
+#These are the hosts we wake up, put in order of preference
+open(HOSTS,"< $wakehostsfile") or die "Cannot open $wakehostsfile";
+while (<HOSTS>) {
+   chomp;
+   s/#.*//;
+   push(@wakeupHosts,$_) if $_;
+}
+close(HOSTS);
+
+# See if there are any waiting jobs
+#job-ID  prior   name       user         state submit/start at     queue                 slots ja-task-ID
+
+open(QSTAT,'qstat -u \* |');
+my $now = new Date::Manip::Date("now");
+while (<QSTAT>) {
+   chomp;
+   my ($jobid,$prior,$name,$user,$state,$submitdate,$submittime,$extra) = split;
+   if (defined($state) && $state eq 'qw') {
+      # Determine how many seconds ago the job was submitted
+      my $subdate = new Date::Manip::Date("$submitdate $submittime");
+      my $seconds = $now->calc($subdate, 1)->printf('%sys');
+
+      # Wait for 60 seconds for scheduler to process new jobs
+      push(@waiting,$jobid) if $seconds > 60;
+      my ($slots,$tasklist) = split(" ",$extra);
+   }
+}
+close(QSTAT);
+
+# Quit if no waiting jobs
+exit unless @waiting;
+
+# Open status files
+# Last host we tried to wake up
+$lastwake = "";
+if (-f "/var/lib/gewake/last") {
+  chomp($lastwake = `cat /var/lib/gewake/last`);
+}
+
+# List of hosts to not wake up
+@blacklist = ();
+if (-f "/var/lib/gewake/blacklist") {
+  open(BL,"< /var/lib/gewake/blacklist");
+  while (<BL>) {
+    chomp;
+    push(@blacklist,$_);
+  }
+  close(BL);
+}
+
+# Debug
+if (defined($opts{'d'}) and @waiting) {
+  print "Waiting: " . join(",",@waiting) . "\n";
+}
+
+# Collect queue information
+#queuename                      qtype used/tot. load_avg arch          states
+open(QSTAT,'qstat -f -F|');
+my ($queue,$host);
+while (<QSTAT>) {
+   chomp;
+   if (/@/) {
+      my ($queueent,$qtype,$slots,$loadave,$arch,$state) = split;
+      # Strip domain
+      $queueent =~ s/\.[^@]*$//;
+      ($queue,$host) = split("@",$queueent);
+
+      # Debug
+      print "$_ -> ($queue,$host)\n" if (defined($opts{'d'}));
+
+      # Add to list of queues unless it is disabled
+      push(@{$queuesForHost{$host}},$queue) unless $state =~ /d/;
+
+      # Record default status for queues that are up.  We don't set
+      # the status for down ones because we may override them later
+      if ($loadave ne "-NA-") {
+         $status{$queueent} = "up";
+      }
+   } elsif (my ($type,$resource,$value) = /(\w\w):(\S+)=(\S+)/) {
+      # Parse the resources for the queue
+      print STDERR "Cannot parse $_ for resources\n" unless defined($resource);
+      if ($resource =~ /^mem_/) { $value = &memValue($value); }
+      $qhresource{"$queue\@$host"}->{$resource} = $value;
+   }
+}
+close(QSTAT);
+
+# See why the jobs are waiting
+# qstat -j output:
+#hard_queue_list:   compute.q
+#scheduling info:   queue instance "queue@hostname"
+#                   queue instance "queue@hostname" dropped because it is temporarily not available
+#                   queue instance "queue@hostname" dropped because it is full
+#                   queue instance "queue@hostname" dropped because it is disabled
+#                   cannot run in queue "queue" because it is not contained in its hard queue list (-q)
+JOB: foreach $jobid (@waiting) {
+   print("Processing $jobid\n") if (defined($opts{'d'}));
+   my $schedinfo = 0;
+   my $hardqueuelist = "";
+   my $error = 0;
+   %hardresource = ();
+   open(QSTAT,"qstat -j $jobid |");
+   while (<QSTAT>) {
+      chomp;
+      # Job is in error state
+      $error = 1 if /^error reason/;
+
+      # Get the hard resources to see if we can avoid waking up machines that
+      # don't satisfy them
+      if (/^hard resource_list:\s+(\S+)/) {
+         foreach $item (split(",",$1)) {
+            my ($resource,$value) = split("=",$item);
+            if ($resource =~ /^mem_/) { $value = &memValue($value); }
+            $hardresource{$resource} = $value;
+         }
+      }
+
+      # Signal start of scheduling info parsing
+      $schedinfo = 1 if s/^scheduling info://;
+
+      if (!$schedinfo) {
+         next unless /^hard_queue_list:\s*(.*)/;
+         # Record the hard queue list request
+         $hardqueuelist = $1;
+         # Strip domain
+         $hardqueuelist =~ s/\.[\w.]+$// if ($hardqueuelist =~ /@/);
+      } else {
+         if (($queue,$status) = /queue instance "(.+)" dropped because it is (.+)/) {
+            # Strip domain
+            $queue =~ s/\.[^@]*$//;
+
+            # Set the status if it isn't already "up"
+            $status{$queue} = $status unless defined($status{$queue});
+
+            # Debug
+            print "status{$queue} = $status\n" if (defined($opts{'d'}));
+         } elsif (($queue,$status) = /queue instance "(.+)" is in (.+)/) {
+            # Strip domain
+            $queue =~ s/\.[^@]*$//;
+
+            # Set the status if it isn't already "up"
+            $status{$queue} = $status unless defined($status{$queue});
+
+            # Debug
+            print "status{$queue} = $status\n" if (defined($opts{'d'}));
+         } else {
+            # We don't think we care about anything else, but list it if debugging
+            print "Unknown status line: $_\n" if (defined($opts{'d'}));
+         }
+      }
+   }
+   close(QSTAT);
+
+   # Don't process error state jobs
+   next if $error;
+
+   # Debug
+   print("$jobid queuelist=$hardqueuelist\n") if (defined($opts{'d'}));
+
+   # For specific host requests
+   if (($queue,$host) = $hardqueuelist =~ /(.+)@(.+)/) {
+      # Wake it up if unavailable
+      if (defined($status{$hardqueuelist}) &&
+          $status{"$hardqueuelist"} eq "temporarily not available") {
+         print("Waking up $host\n");
+         system("$wakeupcmd $host");
+         exit(0);
+      }
+      # Debug
+      print("queuelist=$hardqueuelist already up\n") if (defined($opts{'d'}));
+
+      # Go to the next job
+      next JOB;
+   }
+
+   # Go through the list of wakeupHosts in order and wake up if needed
+   foreach $host (@wakeupHosts) {
+      # We may not have any queues because they may be disabled
+      next if !defined(@{$queuesForHost{$host}});
+
+      # regexp for all of the queues
+      my $queuematch = join("|",@{$queuesForHost{$host}});
+
+      # Just work with the first queue
+      my $queue = ${$queuesForHost{$host}}[0];
+      print STDERR "No queue for host $host\n" if !defined($queue);
+
+      # Debug
+      print "host=$host queuematch=$queuematch $queue status{${queue}\@${host}}=" . $status{"$queue\@$host"} . "\n" if (defined($opts{'d'}));
+
+      # Wakeup if we don't have a hard queue list or it's in our hard queue list,
+      # and the host is down
+      if (($hardqueuelist eq "" || $hardqueuelist =~ /($queuematch)/) &&
+          defined($status{"$queue\@$host"}) &&
+          $status{"$queue\@$host"} eq "temporarily not available") {
+         if (grep(/^$host$/,@blacklist)) {
+            #Blacklisted, skip
+            next;
+         } elsif ($host eq $lastwake) {
+            print("Giving up on $host, trying the next one.\n");
+# This isn't working well right now, but the idea is to give up on failing hosts
+#            open(BL,">> /var/lib/gewake/blacklist");
+#            print BL "$host\n";
+#            close(BL);
+            next;
+         } else {
+            #Check hard resources that we can
+            if (defined($hardresource{"mem_free"})) {
+               print STDERR "No mem_free for $queue\@$host\n" if !defined($qhresource{"$queue\@$host"}->{"mem_free"});
+               next if $hardresource{"mem_free"} > $qhresource{"$queue\@$host"}->{"mem_free"};
+            }
+            if (defined($hardresource{"arch"})) {
+               next if $hardresource{"arch"} ne $qhresource{"$queue\@$host"}->{"arch"};
+            }
+            print("Waking up $host for queue $queue, status = " . $status{"$queue\@$host"} . "\n");
+            system("$wakeupcmd $host");
+
+            # Record that last host woken up
+            open(LAST,"> /var/lib/gewake/last") or die;
+            print LAST "$host\n";
+            close(LAST);
+
+            # Quit to let the host come up and jobs get scheduled to it
+            exit(0);
+         }
+      }
+   }
+}
+
+# If we didn't wake anything up, clear the last woken up hosts status file
+unlink("/var/lib/gewake/last") if (-f "/var/lib/gewake/last");

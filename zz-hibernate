@@ -1,0 +1,148 @@
+#!/bin/bash
+#
+# zz-hibernate - Script to shutdown machine when idle
+#
+# The following variables can be set in /etc/sysconfig/idle:
+#
+#   COMMAND - The command to run to shutdown, defaults to pm-hibernate 
+#   GRIDONLY - If set to true, only use the presence or absence of grid jobs
+# to determine if the machine should get shut down
+#   BLACKLISTED_PROCESSES - Space separated list of process that if running
+# will prevent the machine from being shut down
+#
+# Copyright (C) 2012 Orion Poplawski <orion@cora.nwra.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# 
+exec > /var/log/zz-hibernate 2>&1
+#set -x
+# Defaults
+maxidle=7200  # 2 hours
+
+#Default
+COMMAND=pm-hibernate
+
+# Config
+[ -f /etc/sysconfig/idle ] && . /etc/sysconfig/idle
+
+#Sleep to avoid hourly jobs
+sleep 600
+
+if [ "$GRIDONLY" == yes ]
+then
+   # We only run grid jobs
+   # - no yum process
+   [ -z "`find /var/spool/gridengine -name pid`" -a -z "`ps -e | grep yum`" ] && $COMMAND
+fi
+
+# Calculate console idle time
+if [ -c /dev/tty7 ]; then
+   kbdtime7=`stat -c '%X' /dev/tty7`
+   kbdtime8=`stat -c '%X' /dev/tty8`
+   if [ "$kbdtime7" -gt "$kbdtime8" ]; then
+      kbdtime=$kbdtime7
+   else
+      kbdtime=$kbdtime8
+   fi
+else
+   kbdtime=0
+fi
+
+#This doesn't appear to be working anymore
+if [ -c /dev/input/mice ]; then
+   mousetime=`stat -c '%X' /dev/input/mice`
+else
+   mousetime=0
+fi
+
+now=`date +%s`
+
+if [ "$kbdtime" -gt "$mousetime" ]; then
+   idletime=`expr "$now" - "$kbdtime"`
+else
+   idletime=`expr "$now" - "$mousetime"`
+fi
+
+#Idle times
+eval `w -hs | while read user tty from idle what
+do
+   if [ $idle = ${idle/[0-9]/} ]
+   then
+      continue
+   elif [ $idle != ${idle/dm/} ]
+   then
+      continue
+   elif [ $idle != ${idle/days/} ]
+   then
+      idle=$((${idle/days/} * 3600 * 24))
+   elif [ $idle != ${idle/s/} ]
+   then
+      idle=$((${idle/.00s/}))
+   elif [ $idle != ${idle/m/} ]
+   then
+      #Minutes
+      idle=${idle/m/}
+      idle=$((${idle/:*/} * 3600 + 10#${idle/*:/} * 60))
+   else
+      idle=$((${idle/:*/} * 60 + 10#${idle/*:/}))
+   fi
+
+   if [ "$idle" -lt $idletime ]
+   then
+      idletime=$idle
+      echo idletime=$idle
+   fi
+done`
+
+#Blacklisted processes
+blacklist=
+if [ -n "$BLACKLISTED_PROCESSES" ]
+then
+   for prog in $BLACKLISTED_PROCESSES
+   do
+       if [ `ps -C $prog | wc -l` -gt 1 ]
+       then
+          blacklist="$blacklist $prog"
+       fi
+   done
+fi
+
+# Shutdown if:
+# - load average is low
+# - no one logged in
+# - there are no running jobs
+# - no yum process
+# - no blacklisted processes
+[ -z "`awk '$1 > 0.07 || $2 > 0.07' /proc/loadavg`" -a \
+  -z "`find /var/spool/gridengine -name pid`" -a \
+  -z "`w -hs`" -a \
+  -z "`ps -e | grep yum`" -a \
+  -z "$blacklist" ] &&
+  mv /var/log/zz-hibernate /var/log/zz-shutdown &&
+  /sbin/shutdown -h now
+
+# Hibernate if:
+# - load average is low
+# - terminal sessions all idle for at least 24 hours
+# - there are no running jobs
+# - no console activity for 2 hours with someone logged in
+# - no yum process
+# - no blacklisted processes
+[ -z "`awk '$1 > 0.07 || $2 > 0.07' /proc/loadavg`" -a \
+  -z "`find /var/spool/gridengine -name pid`" -a \
+  \( -z "`w -hs`" -o "$idletime" -gt "${maxidle}" \) -a \
+  -z "`ps -e | grep yum`" -a \
+  -z "$blacklist" ] &&
+  mv /var/log/zz-hibernate /var/log/zz-hibernate.sleep &&
+  $COMMAND

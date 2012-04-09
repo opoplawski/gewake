@@ -1,0 +1,84 @@
+#!/bin/ksh
+#
+# wakeup - wakes up a host by sending Wake-On-Lan magic packet with ether-wake
+#
+# Copyright (C) 2012 Orion Poplawski <orion@cora.nwra.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# root generally runs this via gewake and we don't want to wait
+[ `id -u` -eq 0 ] && QUIET=-q
+
+# The list of ethernet macaddrs for the hosts
+etherhostlist=/nfs/local/etc/wakeup
+
+# Parse options
+while getopts "q" opt
+do
+    case $opt in
+        q) QUIET=-q;;
+       \?)
+           echo "Use: wakeup [-q] hostname" >&2
+           echo " -q quiet - don't wait for the host to come up" >&2
+           exit 1
+           ;;
+    esac
+done
+shift $(($OPTIND - 1))
+host=$1
+
+# Declare the associative array for the ethernet macaddrs
+typeset -A ether
+
+# Source the list of ethernet addresses
+. ${etherhostlist}
+
+# Set the ethernet address
+macaddr=${ether[$host]}
+
+# Quit if unknown
+if [ -z "$macaddr" ]
+then
+ echo "ERROR: Unknown host $host, add to $wakeuphosts!" 1>&2; exit 1
+fi
+
+if [ `id -u` -ne 0 ]
+then
+   sudo=sudo
+fi
+
+#Send it out all interfaces to be safe
+/sbin/ip link | awk -F: '/BROADCAST/ { print $2 }' | while read if x
+do
+   $sudo /sbin/ether-wake -i $if $macaddr 2>&1 | grep -vF 'sendto: Network is down'
+done
+
+#Non-root, wait for the machine to come up
+if [ -z "$QUIET" ]
+then
+   echo -n "Waiting for $host to come up."
+   i=0
+   while [ $i -lt 60 ]
+   do
+      # Try to connect to ssh to see if up
+      perl -e "use IO::Socket; IO::Socket::INET->new(Proto=>'tcp',PeerAddr=>$host,PeerPort=>'ssh') or exit(1);" && {
+         echo " UP!"
+         exit
+      }
+      echo -n "."
+      let i++
+      sleep 1
+   done
+   echo -e " FAILED!\nGave up waiting for $host to come up."
+fi

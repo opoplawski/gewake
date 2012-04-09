@@ -1,0 +1,4 @@
+# Monitor grid jobs and wakeup hosts when needed
+# Adjust frequency to allow time for a machine to wakeup and start
+# receiving jobs
+0-59/3 * * * * root . /etc/profile.d/sge.sh; /usr/local/bin/gewake
