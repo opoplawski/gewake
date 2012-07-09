@@ -62,17 +62,38 @@ close(HOSTS);
 
 open(QSTAT,'qstat -u \* |');
 my $now = new Date::Manip::Date("now");
+my %jobinfo;
 while (<QSTAT>) {
    chomp;
-   my ($jobid,$prior,$name,$user,$state,$submitdate,$submittime,$extra) = split;
+   my ($jobid,$prior,$name,$user,$state,$submitdate,$submittime,$slots,$tasklist) = split;
    if (defined($state) && $state eq 'qw') {
       # Determine how many seconds ago the job was submitted
       my $subdate = new Date::Manip::Date("$submitdate $submittime");
       my $seconds = $now->calc($subdate, 1)->printf('%sys');
 
       # Wait for 60 seconds for scheduler to process new jobs
-      push(@waiting,$jobid) if $seconds > 60;
-      my ($slots,$tasklist) = split(" ",$extra);
+      if ($seconds > 60) {
+         push(@waiting,$jobid);
+
+         #Track some other info
+         my $numtasks = 0;
+         print "$jobid slots=$slots, tasklist=$tasklist" if (defined($opts{'d'}));
+         if (defined($tasklist) and $tasklist ne "") {
+            $jobinfo{$jobid}->{"tasklist"} = $tasklist;
+            foreach $taskentry (split(",",$tasklist)) {
+               my ($starttask,$endtask,$stride);
+               if (($starttask,$endtask,$stride) = ($taskentry =~ /(\d+)-(\d+):(\d+)/)) {
+                  $numtasks += ($endtask-$starttask+1)/$stride;
+               } elsif ($taskentry =~ /^\d+$/) {
+                  $numtasks++;
+               }
+            }
+         } else {
+            $numtasks = 1;
+         }
+         print "($numtasks)\n" if (defined($opts{'d'}));
+         $jobinfo{$jobid}->{"slots"} = $slots * $numtasks;
+      }
    }
 }
 close(QSTAT);
@@ -126,6 +147,9 @@ while (<QSTAT>) {
       if ($loadave ne "-NA-") {
          $status{$queueent} = "up";
       }
+
+      # Record number of slots in the queue entry
+      $qhresource{$queueent}->{"slots"} = $slots;
    } elsif (my ($type,$resource,$value) = /(\w\w):(\S+)=(\S+)/) {
       # Parse the resources for the queue
       print STDERR "Cannot parse $_ for resources\n" unless defined($resource);
@@ -207,14 +231,19 @@ JOB: foreach $jobid (@waiting) {
    # Debug
    print("$jobid queuelist=$hardqueuelist\n") if (defined($opts{'d'}));
 
-   # For specific host requests
+   # For specific host requests (we only handle single machine requests)
    if (($queue,$host) = $hardqueuelist =~ /(.+)@(.+)/) {
       # Wake it up if unavailable
       if (defined($status{$hardqueuelist}) &&
           $status{"$hardqueuelist"} eq "temporarily not available") {
          print("Waking up $host\n");
          system("$wakeupcmd $host");
-         exit(0);
+
+         # See if we need more slots
+         $jobinfo{$jobid}->{"slots"} -= $qhresource{"$queue\@$host"}->{"slots"};
+         print("slots left = " . $jobinfo{$jobid}->{"slots"} . "\n") if (defined($opts{'d'}));
+
+         exit(0) if $jobinfo{$jobid}->{"slots"} <= 0;
       }
       # Debug
       print("queuelist=$hardqueuelist already up\n") if (defined($opts{'d'}));
@@ -224,7 +253,7 @@ JOB: foreach $jobid (@waiting) {
    }
 
    # Go through the list of wakeupHosts in order and wake up if needed
-   foreach $host (@wakeupHosts) {
+   HOST: foreach $host (@wakeupHosts) {
       # We may not have any queues because they may be disabled
       next if !defined(@{$queuesForHost{$host}});
 
@@ -269,6 +298,17 @@ JOB: foreach $jobid (@waiting) {
             open(LAST,"> /var/lib/gewake/last") or die;
             print LAST "$host\n";
             close(LAST);
+
+            # Redeuce the slots needed by the slots provided by this host
+            $jobinfo{$jobid}->{"slots"} -= $qhresource{"$queue\@$host"}->{"slots"};
+            print("slots left = " . $jobinfo{$jobid}->{"slots"} . "\n") if (defined($opts{'d'}));
+
+            # If this job needs more slots, sleep a bit to stagger power ups
+            # then try another host
+            if ($jobinfo{$jobid}->{"slots"} > 0) {
+               sleep(5);
+               next HOST;
+            }
 
             # Quit to let the host come up and jobs get scheduled to it
             exit(0);
