@@ -11,10 +11,10 @@ Overview
 
 gewake is run periodically from cron.  It runs qstat to see if any jobs
 are waiting.  If there are, it looks for hosts that are down and wakes one
-up from its list of hosts.  To do this it runs a wakeup command with the
-hostname of the machine to wake up as the argument.  A sample wakeup command
-is provided that uses ether-wake to send a magic WOL packet to the machine,
-but it could be done in other ways.
+or more up from its list of hosts.  To do this it runs a wakeup command with
+the hostname of the machine to wake up as the argument.  A sample wakeup
+command is provided that uses ether-wake to send a magic WOL packet to the
+machine, but it could be done in other ways.
 
 Installation
 ============
@@ -59,4 +59,4 @@ paths and preferences.
 Author
 ======
 
-  Orion Poplawski <orion@cora.nwra.com>
+  Orion Poplawski <orion@nwra.com>
