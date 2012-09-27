@@ -159,6 +159,26 @@ while (<QSTAT>) {
 }
 close(QSTAT);
 
+# Get information on complexes
+# qconf -sc
+#  #name               shortcut    type        relop requestable consumable default  urgency 
+#  #-----------------------------------------------------------------------------------------
+#  arch                a           RESTRING    ==    YES         NO         NONE     0
+my (%complex);
+open(QCONF,'qconf -sc |') or die 'Cannot run qconf -sc';
+while (<QCONF>) {
+   next if /^#/;
+   chomp;
+   my ($name,$shortcut,$type,$relop,$req,$con,$default,$urgency) = split(" ");
+   # Only need requestable ones
+   if ($req eq "YES") {
+      $complex{$name}->{"type"} = $type;
+      # Modify operator for string comparisons
+      if ($type eq "RESTRING") { $relop = "eq" };
+      $complex{$name}->{"relop"} = $relop;
+   }
+}
+
 # See why the jobs are waiting
 # qstat -j output:
 #hard_queue_list:   compute.q
@@ -274,23 +294,30 @@ JOB: foreach $jobid (@waiting) {
           $status{"$queue\@$host"} eq "temporarily not available") {
          if (grep(/^$host$/,@blacklist)) {
             #Blacklisted, skip
-            next;
+            print STDERR "Skipping blacklisted host $host\n" if (defined($opts{'d'}));
+            next HOST;
          } elsif ($host eq $lastwake) {
             print("Giving up on $host, trying the next one.\n");
 # This isn't working well right now, but the idea is to give up on failing hosts
 #            open(BL,">> /var/lib/gewake/blacklist");
 #            print BL "$host\n";
 #            close(BL);
-            next;
+            next HOST;
          } else {
-            #Check hard resources that we can
-            if (defined($hardresource{"mem_free"})) {
-               print STDERR "No mem_free for $queue\@$host\n" if !defined($qhresource{"$queue\@$host"}->{"mem_free"});
-               next if $hardresource{"mem_free"} > $qhresource{"$queue\@$host"}->{"mem_free"};
+            # Check hard resources using the appropriate complex method
+            foreach $resource (sort(keys(%hardresource))) {
+               if (defined($qhresource{"$queue\@$host"}->{$resource})) {
+                  print STDERR "Checking resource requirement $resource: " if (defined($opts{'d'}));
+                  print STDERR "next HOST if !($hardresource{$resource} $complex{$resource}->{relop} " . $qhresource{"$queue\@$host"}->{$resource} . ")\n" if (defined($opts{'d'}));
+                  if ($complex{$resource}->{'relop'} eq "eq") {
+                     # Need to quote strings
+                     next HOST if eval "!(\"$hardresource{$resource}\" $complex{$resource}->{'relop'} \"$qhresource{\"$queue\@$host\"}->{$resource}\") ";
+                  } else {
+                     next HOST if eval "!($hardresource{$resource} $complex{$resource}->{'relop'} $qhresource{\"$queue\@$host\"}->{$resource}) ";
+                  }
+               }
             }
-            if (defined($hardresource{"arch"})) {
-               next if $hardresource{"arch"} ne $qhresource{"$queue\@$host"}->{"arch"};
-            }
+
             print("Waking up $host for queue $queue, status = " . $status{"$queue\@$host"} . "\n");
             system("$wakeupcmd $host");
 
