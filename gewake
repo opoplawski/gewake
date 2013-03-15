@@ -37,7 +37,7 @@ sub memValue {
    return $arg;
 }
 
-my $version = "1.1";
+my $version = "1.2";
 my $wakehostsfile = "/usr/local/etc/gewake.hosts";
 my $wakeupcmd = "/usr/local/bin/wakeup";
 my $usage = <<EOU;
@@ -144,7 +144,7 @@ while (<QSTAT>) {
 
       # Record default status for queues that are up.  We don't set
       # the status for down ones because we may override them later
-      if ($loadave ne "-NA-") {
+      if ($state !~ "u") {
          $status{$queueent} = "up";
       }
 
@@ -171,11 +171,12 @@ while (<QCONF>) {
    chomp;
    my ($name,$shortcut,$type,$relop,$req,$con,$default,$urgency) = split(" ");
    # Only need requestable ones
-   if ($req eq "YES") {
+   if ($req eq "YES" or $req eq "FORCED") {
       $complex{$name}->{"type"} = $type;
       # Modify operator for string comparisons
       if ($type eq "RESTRING") { $relop = "eq" };
       $complex{$name}->{"relop"} = $relop;
+      print "complex: $name $type $relop\n" if defined($opts{'d'});
    }
 }
 
@@ -187,8 +188,9 @@ while (<QCONF>) {
 #                   queue instance "queue@hostname" dropped because it is full
 #                   queue instance "queue@hostname" dropped because it is disabled
 #                   cannot run in queue "queue" because it is not contained in its hard queue list (-q)
+my @wokenhosts = ();
 JOB: foreach $jobid (@waiting) {
-   print("Processing $jobid\n") if (defined($opts{'d'}));
+   print("Processing $jobid(slots=$jobinfo{$jobid}->{slots})\n") if (defined($opts{'d'}));
    my $schedinfo = 0;
    my $hardqueuelist = "";
    my $error = 0;
@@ -219,7 +221,8 @@ JOB: foreach $jobid (@waiting) {
          # Strip domain
          $hardqueuelist =~ s/\.[\w.]+$// if ($hardqueuelist =~ /@/);
       } else {
-         if (($queue,$status) = /queue instance "(.+)" dropped because it is (.+)/) {
+         my $junk;
+         if (($queue,$junk,$status) = /queue instance "(.+)" (dropped |)because it is (.+)/) {
             # Strip domain
             $queue =~ s/\.[^@]*$//;
 
@@ -237,6 +240,11 @@ JOB: foreach $jobid (@waiting) {
 
             # Debug
             print "status{$queue} = $status\n" if (defined($opts{'d'}));
+         } elsif (($queue) = /has no permission for cluster queue "(.+)"/) {
+            $status{$queue} = "noaccess";
+
+            # Debug
+            print "status{$queue} = noaccess\n" if (defined($opts{'d'}));
          } else {
             # We don't think we care about anything else, but list it if debugging
             print "Unknown status line: $_\n" if (defined($opts{'d'}));
@@ -253,11 +261,18 @@ JOB: foreach $jobid (@waiting) {
 
    # For specific host requests (we only handle single machine requests)
    if (($queue,$host) = $hardqueuelist =~ /(.+)@(.+)/) {
-      # Wake it up if unavailable
+      # Wake it up if unavailable and we haven't already done so
       if (defined($status{$hardqueuelist}) &&
-          $status{"$hardqueuelist"} eq "temporarily not available") {
+          $status{"$hardqueuelist"} eq "temporarily not available" &&
+          !grep($_ eq $host,@wokenhosts)) {
          print("Waking up $host\n");
          system("$wakeupcmd $host");
+         push(@wokenhosts,$host);
+
+         # Record that last host woken up
+         open(LAST,"> /var/lib/gewake/last") or die;
+         print LAST "$host\n";
+         close(LAST);
 
          # See if we need more slots
          $jobinfo{$jobid}->{"slots"} -= $qhresource{"$queue\@$host"}->{"slots"};
@@ -277,8 +292,11 @@ JOB: foreach $jobid (@waiting) {
       # We may not have any queues because they may be disabled
       next if !defined(@{$queuesForHost{$host}});
 
-      # regexp for all of the queues
-      my $queuematch = join("|",@{$queuesForHost{$host}});
+      # Skip if we've already tried to wake it up
+      next if grep($_ eq $host,@wokenhosts);
+
+      # regexp for all of the queues we have access to
+      my $queuematch = join("|",grep {!defined($status{$_}) or $status{$_} ne "noaccess"} @{$queuesForHost{$host}});
 
       # Just work with the first queue
       my $queue = ${$queuesForHost{$host}}[0];
@@ -320,6 +338,7 @@ JOB: foreach $jobid (@waiting) {
 
             print("Waking up $host for queue $queue, status = " . $status{"$queue\@$host"} . "\n");
             system("$wakeupcmd $host");
+            push(@wokenhosts,$host);
 
             # Record that last host woken up
             open(LAST,"> /var/lib/gewake/last") or die;
