@@ -219,7 +219,7 @@ JOB: foreach $jobid (@waiting) {
          # Record the hard queue list request
          $hardqueuelist = $1;
          # Strip domain
-         $hardqueuelist =~ s/\.[\w.]+$// if ($hardqueuelist =~ /@/);
+         $hardqueuelist =~ s/(@\w+)\.[\w.]+/$1/g if ($hardqueuelist =~ /@/);
       } else {
          my $junk;
          if (($queue,$junk,$status) = /queue instance "(.+)" (dropped |)because it is (.+)/) {
@@ -257,32 +257,44 @@ JOB: foreach $jobid (@waiting) {
    next if $error;
 
    # Debug
-   print("$jobid queuelist=$hardqueuelist\n") if (defined($opts{'d'}));
+   print("$jobid hardqueuelist=$hardqueuelist\n") if (defined($opts{'d'}));
 
-   # For specific host requests (we only handle single machine requests)
-   if (($queue,$host) = $hardqueuelist =~ /(.+)@(.+)/) {
-      # Wake it up if unavailable and we haven't already done so
-      if (defined($status{$hardqueuelist}) &&
-          $status{"$hardqueuelist"} eq "temporarily not available" &&
-          !grep($_ eq $host,@wokenhosts)) {
-         print("Waking up $host\n");
-         system("$wakeupcmd $host");
-         push(@wokenhosts,$host);
+   # For specific host requests
+   QUEUEENTRY: foreach $hardqueueentry (split(",",$hardqueuelist)) {
+      if (($queue,$host) = $hardqueueentry =~ /(.+)@(.+)/) {
+         # Debug
+         print("hardqueueentry=$hardqueueentry status= $status{$hardqueueentry}\n") if (defined($opts{'d'}));
+         # Wake it up if unavailable and we haven't already done so
+         if (defined($status{$hardqueueentry}) &&
+             $status{"$hardqueueentry"} eq "temporarily not available" &&
+             !grep($_ eq $host,@wokenhosts)) {
+            print("Waking up $host\n");
+            system("$wakeupcmd $host");
+            push(@wokenhosts,$host);
 
-         # Record that last host woken up
-         open(LAST,"> /var/lib/gewake/last") or die;
-         print LAST "$host\n";
-         close(LAST);
+            # Record that last host woken up
+            open(LAST,"> /var/lib/gewake/last") or die;
+            print LAST "$host\n";
+            close(LAST);
 
-         # See if we need more slots
-         $jobinfo{$jobid}->{"slots"} -= $qhresource{"$queue\@$host"}->{"slots"};
-         print("slots left = " . $jobinfo{$jobid}->{"slots"} . "\n") if (defined($opts{'d'}));
+            # See if we need more slots
+            $jobinfo{$jobid}->{"slots"} -= $qhresource{"$queue\@$host"}->{"slots"};
+            print("slots left = " . $jobinfo{$jobid}->{"slots"} . "\n") if (defined($opts{'d'}));
 
-         exit(0) if $jobinfo{$jobid}->{"slots"} <= 0;
+            # If this job needs more slots, sleep a bit to stagger power ups
+            # then try another host
+            if ($jobinfo{$jobid}->{"slots"} > 0) {
+               sleep(5);
+               next QUEUEENTRY;
+            }
+
+            # Quit to let the host(s) come up and jobs get scheduled to it
+            exit(0);
+         } else {
+            # Try the next entry in the hardquelist
+            next QUEUEENTRY;
+         }
       }
-      # Debug
-      print("queuelist=$hardqueuelist already up\n") if (defined($opts{'d'}));
-
       # Go to the next job
       next JOB;
    }
@@ -356,7 +368,7 @@ JOB: foreach $jobid (@waiting) {
                next HOST;
             }
 
-            # Quit to let the host come up and jobs get scheduled to it
+            # Quit to let the host(s) come up and jobs get scheduled to it
             exit(0);
          }
       }
