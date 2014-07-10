@@ -264,10 +264,10 @@ JOB: foreach $jobid (@waiting) {
       if (($queue,$host) = $hardqueueentry =~ /(.+)@(.+)/) {
          # Debug
          print("hardqueueentry=$hardqueueentry status= $status{$hardqueueentry}\n") if (defined($opts{'d'}));
-         # Wake it up if unavailable and we haven't already done so
+         # Wake it up if unavailable, we haven't already done so, and it's in the list of hosts to wake up
          if (defined($status{$hardqueueentry}) &&
              $status{"$hardqueueentry"} eq "temporarily not available" &&
-             !grep($_ eq $host,@wokenhosts)) {
+             !grep($_ eq $host,@wokenhosts) && grep($_ eq $host,@wakeupHosts)) {
             print("Waking up $host\n");
             system("$wakeupcmd $host");
             push(@wokenhosts,$host);
