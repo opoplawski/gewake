@@ -256,45 +256,48 @@ JOB: foreach $jobid (@waiting) {
    # Don't process error state jobs
    next if $error;
 
-   # Debug
-   print("$jobid hardqueuelist=$hardqueuelist\n") if (defined($opts{'d'}));
-
    # For specific host requests
-   QUEUEENTRY: foreach $hardqueueentry (split(",",$hardqueuelist)) {
-      if (($queue,$host) = $hardqueueentry =~ /(.+)@(.+)/) {
-         # Debug
-         print("hardqueueentry=$hardqueueentry status= $status{$hardqueueentry}\n") if (defined($opts{'d'}));
-         # Wake it up if unavailable, we haven't already done so, and it's in the list of hosts to wake up
-         if (defined($status{$hardqueueentry}) &&
-             $status{"$hardqueueentry"} eq "temporarily not available" &&
-             !grep($_ eq $host,@wokenhosts) && grep($_ eq $host,@wakeupHosts)) {
-            print("Waking up $host\n");
-            system("$wakeupcmd $host");
-            push(@wokenhosts,$host);
+   if ($hardqueuelist) {
+      # Debug
+      print("$jobid hardqueuelist=$hardqueuelist\n") if (defined($opts{'d'}));
 
-            # Record that last host woken up
-            open(LAST,"> /var/lib/gewake/last") or die;
-            print LAST "$host\n";
-            close(LAST);
+      QUEUEENTRY: foreach $hardqueueentry (split(",",$hardqueuelist)) {
+         if (($queue,$host) = $hardqueueentry =~ /(.+)@(.+)/) {
+            # Debug
+            print("hardqueueentry=$hardqueueentry status=$status{$hardqueueentry}\n") if (defined($opts{'d'}));
+            # Wake it up if unavailable, we haven't already done so, and it's in the list of hosts to wake up
+            if (defined($status{$hardqueueentry}) &&
+                $status{"$hardqueueentry"} eq "temporarily not available" &&
+                !grep($_ eq $host,@wokenhosts) && grep($_ eq $host,@wakeupHosts)) {
+               print("Waking up $host\n");
+               system("$wakeupcmd $host");
+               push(@wokenhosts,$host);
 
-            # See if we need more slots
-            $jobinfo{$jobid}->{"slots"} -= $qhresource{"$queue\@$host"}->{"slots"};
-            print("slots left = " . $jobinfo{$jobid}->{"slots"} . "\n") if (defined($opts{'d'}));
+               # Record that last host woken up
+               open(LAST,"> /var/lib/gewake/last") or die;
+               print LAST "$host\n";
+               close(LAST);
 
-            # If this job needs more slots, sleep a bit to stagger power ups
-            # then try another host
-            if ($jobinfo{$jobid}->{"slots"} > 0) {
-               sleep(5);
+               # See if we need more slots
+               $jobinfo{$jobid}->{"slots"} -= $qhresource{"$queue\@$host"}->{"slots"};
+               print("slots left = " . $jobinfo{$jobid}->{"slots"} . "\n") if (defined($opts{'d'}));
+
+               # If this job needs more slots, sleep a bit to stagger power ups
+               # then try another host
+               if ($jobinfo{$jobid}->{"slots"} > 0) {
+                  sleep(5);
+                  next QUEUEENTRY;
+               }
+
+               # Quit to let the host(s) come up and jobs get scheduled to it
+               exit(0);
+            } else {
+               # Try the next entry in the hardquelist
                next QUEUEENTRY;
             }
-
-            # Quit to let the host(s) come up and jobs get scheduled to it
-            exit(0);
-         } else {
-            # Try the next entry in the hardquelist
-            next QUEUEENTRY;
          }
       }
+
       # Go to the next job
       next JOB;
    }
