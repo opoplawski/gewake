@@ -40,6 +40,7 @@ sub memValue {
 my $version = "1.2";
 my $wakehostsfile = "/usr/local/etc/gewake.hosts";
 my $wakeupcmd = "/usr/local/bin/wakeup";
+my %status = ();
 my $usage = <<EOU;
 Usage: gewake [-d]
 
@@ -66,7 +67,7 @@ my %jobinfo;
 while (<QSTAT>) {
    chomp;
    my ($jobid,$prior,$name,$user,$state,$submitdate,$submittime,$slots,$tasklist) = split;
-   if (defined($state) && $state eq 'qw') {
+   if (defined($state) && $state =~ /q/ && $state !~ /E/) {
       # Determine how many seconds ago the job was submitted
       my $subdate = new Date::Manip::Date("$submitdate $submittime");
       my $seconds = $now->calc($subdate, 1)->printf('%sys');
@@ -93,20 +94,23 @@ while (<QSTAT>) {
          }
          print "($numtasks)\n" if (defined($opts{'d'}));
          $jobinfo{$jobid}->{"slots"} = $slots * $numtasks;
+         $jobinfo{$jobid}->{"user"} = $user;
       }
    }
 }
 close(QSTAT);
-
-# Quit if no waiting jobs
-exit unless @waiting;
 
 # Open status files
 # Last host we tried to wake up
 $lastwake = "";
 if (-f "/var/lib/gewake/last") {
   chomp($lastwake = `cat /var/lib/gewake/last`);
+  # clear the last woken up hosts status file
+  unlink("/var/lib/gewake/last");
 }
+
+# Quit if no waiting jobs
+exit unless @waiting;
 
 # List of hosts to not wake up
 @blacklist = ();
@@ -147,9 +151,15 @@ while (<QSTAT>) {
       if ($state !~ "u") {
          $status{$queueent} = "up";
       }
+      if ($state =~ "d") {
+         $status{$queueent} = "disabled";
+      }
 
       # Record number of slots in the queue entry
       $qhresource{$queueent}->{"slots"} = $slots;
+
+      # Record queue type
+      $queuetype{$queue} = $qtype
    } elsif (my ($type,$resource,$value) = /(\w\w):(\S+)=(\S+)/) {
       # Parse the resources for the queue
       print STDERR "Cannot parse $_ for resources\n" unless defined($resource);
@@ -194,7 +204,8 @@ JOB: foreach $jobid (@waiting) {
    my $schedinfo = 0;
    my $hardqueuelist = "";
    my $error = 0;
-   %hardresource = ();
+   my %hardresource = ();
+   my $parallelenv = "";
    open(QSTAT,"qstat -j $jobid |");
    while (<QSTAT>) {
       chomp;
@@ -215,11 +226,15 @@ JOB: foreach $jobid (@waiting) {
       $schedinfo = 1 if s/^scheduling info://;
 
       if (!$schedinfo) {
-         next unless /^hard_queue_list:\s*(.*)/;
-         # Record the hard queue list request
-         $hardqueuelist = $1;
-         # Strip domain
-         $hardqueuelist =~ s/(@\w+)\.[\w.]+/$1/g if ($hardqueuelist =~ /@/);
+         if (/^hard_queue_list:\s*(.*)/) {
+            # Record the hard queue list request
+            $hardqueuelist = $1;
+            # Strip domain
+            $hardqueuelist =~ s/(@\w+)\.[\w.]+/$1/g if ($hardqueuelist =~ /@/);
+         } elsif (/^parallel environment:\s*(.*)/) {
+            $parallelenv = $1;
+         }
+         next;
       } else {
          my $junk;
          if (($queue,$junk,$status) = /queue instance "(.+)" (dropped |)because it is (.+)/) {
@@ -241,10 +256,14 @@ JOB: foreach $jobid (@waiting) {
             # Debug
             print "status{$queue} = $status\n" if (defined($opts{'d'}));
          } elsif (($queue) = /has no permission for cluster queue "(.+)"/) {
-            $status{$queue} = "noaccess";
+            # Strip domain
+            $queue =~ s/\.[^@]*$//;
+
+            # Set the status if it isn't already "up"
+            $status{$queue} = "noaccess" unless defined($status{$queue});
 
             # Debug
-            print "status{$queue} = noaccess\n" if (defined($opts{'d'}));
+            print "status{$queue} = $status\n" if (defined($opts{'d'}));
          } else {
             # We don't think we care about anything else, but list it if debugging
             print "Unknown status line: $_\n" if (defined($opts{'d'}));
@@ -262,14 +281,22 @@ JOB: foreach $jobid (@waiting) {
       print("$jobid hardqueuelist=$hardqueuelist\n") if (defined($opts{'d'}));
 
       QUEUEENTRY: foreach $hardqueueentry (split(",",$hardqueuelist)) {
-         if (($queue,$host) = $hardqueueentry =~ /(.+)@(.+)/) {
+         if ($hardqueueentry !~ /@/) {
+            # If only requesting a queue, find all hosts in that queue
+            @hardqueuehosts = grep($_ =~ /^$hardqueueentry@/,keys(%status));
+         } else {
+            @hardqueuehosts = ($hardqueueentry);
+         }
+         QUEUEHOST: foreach $hardqueuehost (@hardqueuehosts) {
+            my ($queue,$host) = ($hardqueuehost =~ /(.+)@(.+)/);
             # Debug
-            print("hardqueueentry=$hardqueueentry status=$status{$hardqueueentry}\n") if (defined($opts{'d'}));
+            print("hardqueuehost=$hardqueuehost status=$status{$hardqueuehost}\n") if (defined($opts{'d'}));
             # Wake it up if unavailable, we haven't already done so, and it's in the list of hosts to wake up
-            if (defined($status{$hardqueueentry}) &&
-                $status{"$hardqueueentry"} eq "temporarily not available" &&
-                !grep($_ eq $host,@wokenhosts) && grep($_ eq $host,@wakeupHosts)) {
-               print("Waking up $host\n");
+            if (defined($status{$hardqueuehost}) &&
+                $status{"$hardqueuehost"} eq "temporarily not available" &&
+                !grep($_ eq $host,@wokenhosts) && grep($_ eq $host,@wakeupHosts) &&
+                $host ne $lastwake) {
+               print("Waking up $host for $hardqueueentry, status=$status{$hardqueuehost}\n") if ($jobinfo{$jobid}->{"user"} ne "root" or defined($opts{'d'}));
                system("$wakeupcmd $host");
                push(@wokenhosts,$host);
 
@@ -279,21 +306,21 @@ JOB: foreach $jobid (@waiting) {
                close(LAST);
 
                # See if we need more slots
-               $jobinfo{$jobid}->{"slots"} -= $qhresource{"$queue\@$host"}->{"slots"};
+               $jobinfo{$jobid}->{"slots"} -= $qhresource{$hardqueuehost}->{"slots"};
                print("slots left = " . $jobinfo{$jobid}->{"slots"} . "\n") if (defined($opts{'d'}));
 
                # If this job needs more slots, sleep a bit to stagger power ups
                # then try another host
                if ($jobinfo{$jobid}->{"slots"} > 0) {
                   sleep(5);
-                  next QUEUEENTRY;
+                  next QUEUEHOST;
                }
 
                # Quit to let the host(s) come up and jobs get scheduled to it
                exit(0);
             } else {
                # Try the next entry in the hardquelist
-               next QUEUEENTRY;
+               next QUEUEHOST;
             }
          }
       }
@@ -305,7 +332,7 @@ JOB: foreach $jobid (@waiting) {
    # Go through the list of wakeupHosts in order and wake up if needed
    HOST: foreach $host (@wakeupHosts) {
       # We may not have any queues because they may be disabled
-      next if !defined(@{$queuesForHost{$host}});
+      next if !defined($queuesForHost{$host});
 
       # Skip if we've already tried to wake it up
       next if grep($_ eq $host,@wokenhosts);
@@ -313,70 +340,72 @@ JOB: foreach $jobid (@waiting) {
       # regexp for all of the queues we have access to
       my $queuematch = join("|",grep {!defined($status{$_}) or $status{$_} ne "noaccess"} @{$queuesForHost{$host}});
 
-      # Just work with the first queue
-      my $queue = ${$queuesForHost{$host}}[0];
-      print STDERR "No queue for host $host\n" if !defined($queue);
+      # Loop through the queues
+      QUEUE: foreach my $queue (@{$queuesForHost{$host}}) {
+      #print STDERR "No queue for host $host\n" if !defined($queue);
 
-      # Debug
-      print "host=$host queuematch=$queuematch $queue status{${queue}\@${host}}=" . $status{"$queue\@$host"} . "\n" if (defined($opts{'d'}));
+         # Debug
+         print "host=$host queuematch=$queuematch $queue status{${queue}\@${host}}=" . $status{"$queue\@$host"} . "\n" if (defined($opts{'d'}));
 
-      # Wakeup if we don't have a hard queue list or it's in our hard queue list,
-      # and the host is down
-      if (($hardqueuelist eq "" || $hardqueuelist =~ /($queuematch)/) &&
-          defined($status{"$queue\@$host"}) &&
-          $status{"$queue\@$host"} eq "temporarily not available") {
-         if (grep(/^$host$/,@blacklist)) {
-            #Blacklisted, skip
-            print STDERR "Skipping blacklisted host $host\n" if (defined($opts{'d'}));
-            next HOST;
-         } elsif ($host eq $lastwake) {
-            print("Giving up on $host, trying the next one.\n");
-# This isn't working well right now, but the idea is to give up on failing hosts
-#            open(BL,">> /var/lib/gewake/blacklist");
-#            print BL "$host\n";
-#            close(BL);
-            next HOST;
-         } else {
-            # Check hard resources using the appropriate complex method
-            foreach $resource (sort(keys(%hardresource))) {
-               if (defined($qhresource{"$queue\@$host"}->{$resource})) {
-                  print STDERR "Checking resource requirement $resource: " if (defined($opts{'d'}));
-                  print STDERR "next HOST if !($hardresource{$resource} $complex{$resource}->{relop} " . $qhresource{"$queue\@$host"}->{$resource} . ")\n" if (defined($opts{'d'}));
-                  if ($complex{$resource}->{'relop'} eq "eq") {
-                     # Need to quote strings
-                     next HOST if eval "!(\"$hardresource{$resource}\" $complex{$resource}->{'relop'} \"$qhresource{\"$queue\@$host\"}->{$resource}\") ";
-                  } else {
-                     next HOST if eval "!($hardresource{$resource} $complex{$resource}->{'relop'} $qhresource{\"$queue\@$host\"}->{$resource}) ";
+         # Skip queue if it is the wrong type
+         next QUEUE if $parallelenv eq "" and $queuetype{$queue} !~ /B/;
+         next QUEUE if $parallelenv ne "" and $queuetype{$queue} !~ /P/;
+
+         # Wakeup if we don't have a hard queue list or it's in our hard queue list,
+         # and the host is down
+         if (($hardqueuelist eq "" || $hardqueuelist =~ /($queuematch)/) &&
+             defined($status{"$queue\@$host"}) &&
+             $status{"$queue\@$host"} eq "temporarily not available") {
+            if (grep(/^$host$/,@blacklist)) {
+               #Blacklisted, skip
+               print STDERR "Skipping blacklisted host $host\n" if (defined($opts{'d'}));
+               next HOST;
+            } elsif ($host eq $lastwake) {
+               print("Giving up on $host, trying the next one.\n");
+   # This isn't working well right now, but the idea is to give up on failing hosts
+   #            open(BL,">> /var/lib/gewake/blacklist");
+   #            print BL "$host\n";
+   #            close(BL);
+               next HOST;
+            } else {
+               # Check hard resources using the appropriate complex method
+               foreach $resource (sort(keys(%hardresource))) {
+                  if (defined($qhresource{"$queue\@$host"}->{$resource})) {
+                     print STDERR "Checking resource requirement $resource: " if (defined($opts{'d'}));
+                     print STDERR "next HOST if !($hardresource{$resource} $complex{$resource}->{relop} " . $qhresource{"$queue\@$host"}->{$resource} . ")\n" if (defined($opts{'d'}));
+                     if ($complex{$resource}->{'relop'} eq "eq") {
+                        # Need to quote strings
+                        next HOST if eval "!(\"$hardresource{$resource}\" $complex{$resource}->{'relop'} \"$qhresource{\"$queue\@$host\"}->{$resource}\") ";
+                     } else {
+                        next HOST if eval "!($hardresource{$resource} $complex{$resource}->{'relop'} $qhresource{\"$queue\@$host\"}->{$resource}) ";
+                     }
                   }
                }
+   
+               print("Waking up $host for queue $queue, status = " . $status{"$queue\@$host"} . "\n") unless $jobinfo{$jobid}->{"user"} eq "root";
+               system("$wakeupcmd $host");
+               push(@wokenhosts,$host);
+
+               # Record that last host woken up
+               open(LAST,"> /var/lib/gewake/last") or die;
+               print LAST "$host\n";
+               close(LAST);
+
+               # Redeuce the slots needed by the slots provided by this host
+               $jobinfo{$jobid}->{"slots"} -= $qhresource{"$queue\@$host"}->{"slots"};
+               print("slots left = " . $jobinfo{$jobid}->{"slots"} . "\n") if (defined($opts{'d'}));
+
+               # If this job needs more slots, sleep a bit to stagger power ups
+               # then try another host
+               if ($jobinfo{$jobid}->{"slots"} > 0) {
+                  sleep(5);
+                  next HOST;
+               }
+
+               # Quit to let the host(s) come up and jobs get scheduled to it
+               exit(0);
             }
-
-            print("Waking up $host for queue $queue, status = " . $status{"$queue\@$host"} . "\n");
-            system("$wakeupcmd $host");
-            push(@wokenhosts,$host);
-
-            # Record that last host woken up
-            open(LAST,"> /var/lib/gewake/last") or die;
-            print LAST "$host\n";
-            close(LAST);
-
-            # Redeuce the slots needed by the slots provided by this host
-            $jobinfo{$jobid}->{"slots"} -= $qhresource{"$queue\@$host"}->{"slots"};
-            print("slots left = " . $jobinfo{$jobid}->{"slots"} . "\n") if (defined($opts{'d'}));
-
-            # If this job needs more slots, sleep a bit to stagger power ups
-            # then try another host
-            if ($jobinfo{$jobid}->{"slots"} > 0) {
-               sleep(5);
-               next HOST;
-            }
-
-            # Quit to let the host(s) come up and jobs get scheduled to it
-            exit(0);
          }
       }
    }
 }
-
-# If we didn't wake anything up, clear the last woken up hosts status file
-unlink("/var/lib/gewake/last") if (-f "/var/lib/gewake/last");
