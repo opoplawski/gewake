@@ -73,7 +73,7 @@ while (<QSTAT>) {
       my $seconds = $now->calc($subdate, 1)->printf('%sys');
 
       # Wait for 60 seconds for scheduler to process new jobs
-      if ($seconds > 60) {
+      if ($seconds > 60 or defined($opts{'d'})) {
          push(@waiting,$jobid);
 
          #Track some other info
@@ -287,7 +287,9 @@ JOB: foreach $jobid (@waiting) {
          } else {
             @hardqueuehosts = ($hardqueueentry);
          }
-         QUEUEHOST: foreach $hardqueuehost (@hardqueuehosts) {
+         print "$jobid hardquehosts=" . join(",",@hardqueuehosts) . "\n" if defined($opts{'d'});
+         # Wakeup hosts in wakeupHosts order
+         QUEUEHOST: foreach my $hardqueuehost (map { my $b = $_; grep { $_ =~ /\@$b$/ } @hardqueuehosts } @wakeupHosts) {
             my ($queue,$host) = ($hardqueuehost =~ /(.+)@(.+)/);
             # Debug
             print("hardqueuehost=$hardqueuehost status=$status{$hardqueuehost}\n") if (defined($opts{'d'}));
@@ -297,7 +299,7 @@ JOB: foreach $jobid (@waiting) {
                 !grep($_ eq $host,@wokenhosts) && grep($_ eq $host,@wakeupHosts) &&
                 $host ne $lastwake) {
                print("Waking up $host for $hardqueueentry, status=$status{$hardqueuehost}\n") if ($jobinfo{$jobid}->{"user"} ne "root" or defined($opts{'d'}));
-               system("$wakeupcmd $host");
+               system("$wakeupcmd $host") unless defined($opts{'d'});
                push(@wokenhosts,$host);
 
                # Record that last host woken up
@@ -383,7 +385,7 @@ JOB: foreach $jobid (@waiting) {
                }
    
                print("Waking up $host for queue $queue, status = " . $status{"$queue\@$host"} . "\n") unless $jobinfo{$jobid}->{"user"} eq "root";
-               system("$wakeupcmd $host");
+               system("$wakeupcmd $host") unless defined($opts{'d'});
                push(@wokenhosts,$host);
 
                # Record that last host woken up
