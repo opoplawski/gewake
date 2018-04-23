@@ -206,6 +206,7 @@ JOB: foreach $jobid (@waiting) {
    my $error = 0;
    my %hardresource = ();
    my $parallelenv = "";
+   my $woke = 0;
    open(QSTAT,"qstat -j $jobid |");
    while (<QSTAT>) {
       chomp;
@@ -292,7 +293,18 @@ JOB: foreach $jobid (@waiting) {
          QUEUEHOST: foreach my $hardqueuehost (map { my $b = $_; grep { $_ =~ /\@$b$/ } @hardqueuehosts } @wakeupHosts) {
             my ($queue,$host) = ($hardqueuehost =~ /(.+)@(.+)/);
             # Debug
-            print("hardqueuehost=$hardqueuehost status=$status{$hardqueuehost}\n") if (defined($opts{'d'}));
+            print("$jobid hardqueuehost=$hardqueuehost status=$status{$hardqueuehost}\n") if (defined($opts{'d'}));
+
+            # Skip queue if it is the wrong type
+            if ($parallelenv eq "" and $queuetype{$queue} !~ /B/) {
+               print("$jobid Skipping $hardqueuehost because it is not of type batch\n");
+               next QUEUEHOST
+            }
+            if ($parallelenv ne "" and $queuetype{$queue} !~ /P/) {
+               print("$jobid Skipping $hardqueuehost because it is not of type parallel\n");
+               next QUEUEHOST
+            }
+
             # Wake it up if unavailable, we haven't already done so, and it's in the list of hosts to wake up
             if (defined($status{$hardqueuehost}) &&
                 $status{"$hardqueuehost"} eq "temporarily not available" &&
@@ -300,6 +312,7 @@ JOB: foreach $jobid (@waiting) {
                 $host ne $lastwake) {
                print("Waking up $host for $hardqueueentry, status=$status{$hardqueuehost}\n") if ($jobinfo{$jobid}->{"user"} ne "root" or defined($opts{'d'}));
                system("$wakeupcmd $host") unless defined($opts{'d'});
+               $woke++;
                push(@wokenhosts,$host);
 
                # Record that last host woken up
@@ -372,20 +385,26 @@ JOB: foreach $jobid (@waiting) {
             } else {
                # Check hard resources using the appropriate complex method
                foreach $resource (sort(keys(%hardresource))) {
+                  print STDERR "Checking resource requirement $resource: " if (defined($opts{'d'}));
                   if (defined($qhresource{"$queue\@$host"}->{$resource})) {
-                     print STDERR "Checking resource requirement $resource: " if (defined($opts{'d'}));
-                     print STDERR "next HOST if !($hardresource{$resource} $complex{$resource}->{relop} " . $qhresource{"$queue\@$host"}->{$resource} . ")\n" if (defined($opts{'d'}));
+                     my $thishardresource = $hardresource{$resource};
+                     # Booleans are reported as numeric, but can be specified as true/false
+                     $thishardresource =~ s/true/1.000000/;
+                     print STDERR "next HOST if !($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $jobinfo{$jobid}->{slots}" : "") . ") $complex{$resource}->{relop} " . $qhresource{"$queue\@$host"}->{$resource} . ")\n" if (defined($opts{'d'}));
                      if ($complex{$resource}->{'relop'} eq "eq") {
                         # Need to quote strings
-                        next HOST if eval "!(\"$hardresource{$resource}\" $complex{$resource}->{'relop'} \"$qhresource{\"$queue\@$host\"}->{$resource}\") ";
+                        next HOST if eval "!(\"$thishardresource\" $complex{$resource}->{'relop'} \"$qhresource{\"$queue\@$host\"}->{$resource}\") ";
                      } else {
-                        next HOST if eval "!($hardresource{$resource} $complex{$resource}->{'relop'} $qhresource{\"$queue\@$host\"}->{$resource}) ";
+                        next HOST if eval "!(($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $jobinfo{$jobid}->{slots}" : "") . ") $complex{$resource}->{'relop'} $qhresource{\"$queue\@$host\"}->{$resource})";
                      }
+                  } else {
+                     next HOST;
                   }
                }
    
                print("Waking up $host for queue $queue, status = " . $status{"$queue\@$host"} . "\n") unless $jobinfo{$jobid}->{"user"} eq "root";
                system("$wakeupcmd $host") unless defined($opts{'d'});
+               $woke++;
                push(@wokenhosts,$host);
 
                # Record that last host woken up
