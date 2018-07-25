@@ -41,6 +41,7 @@ sub memValue {
 sub loadParallelEnv {
    my ($envname) = @_;
    my %envconf;
+   my %hostqueues;
 
    open(ENV,"qconf -sp $envname |");
    while (<ENV>) {
@@ -49,6 +50,27 @@ sub loadParallelEnv {
       $envconf{$key} = $value;
    }
    close(ENV);
+
+   # Find the hostqueues in the parallel environment
+   open(ENV,"qstat -f -pe $envname |");
+   while (<ENV>) {
+      chomp;
+      my ($queue,$host,$slots) = ($_ =~ m,^(\S+)@(\S+)\s+\S+\s+\d+/\d+/(\d+),);
+      if (defined($slots)) {
+         # Strip domain
+         $host =~ s/\.[^@]*$//;
+         if (defined($hostqueues{$queue})) {
+            $hostqueues{$queue} += $slots;
+         } else {
+            $hostqueues{$queue} = $slots;
+         }
+         $hostqueues{"$queue\@$host"} = $slots;
+         print "parallel env $envname hostqueues $queue\@$host = $slots\n" if (defined($opts{'d'}));
+         print "parallel env $envname hostqueues $queue = $hostqueues{$queue}\n" if (defined($opts{'d'}));
+      }
+   }
+   close(ENV);
+   $envconf{'hostqueues'} = \%hostqueues;
 
    return \%envconf;
 }
@@ -63,8 +85,9 @@ sub loadParallelEnvs {
       open(ENVS,"qconf -spl |");
       while (<ENVS>) {
          chomp;
+         my $thisenv = $_;
          if (/$envregex/) {
-            $envconf{$envname} = loadParallelEnv($_);
+            $envconf{$thisenv} = loadParallelEnv($thisenv);
          }
       }
       close(ENVS);
@@ -75,7 +98,7 @@ sub loadParallelEnvs {
    return \%envconf;
 }
 
-my $version = "1.3";
+my $version = "1.4";
 my $wakehostsfile = "/usr/local/etc/gewake.hosts";
 my $wakeupcmd = "/usr/local/bin/wakeup";
 my %status = ();
@@ -142,13 +165,16 @@ close(QSTAT);
 # Last host we tried to wake up
 $lastwake = "";
 if (-f "/var/lib/gewake/last") {
-  chomp($lastwake = `cat /var/lib/gewake/last`);
-  # clear the last woken up hosts status file
-  unlink("/var/lib/gewake/last");
+   chomp($lastwake = `cat /var/lib/gewake/last`);
+   # clear the last woken up hosts status file
+   unlink("/var/lib/gewake/last");
 }
 
 # Quit if no waiting jobs
-exit unless @waiting;
+if (not @waiting) {
+   print("No waiting jobs\n") if (defined($opts{'d'}));
+   exit;
+}
 
 # List of hosts to not wake up
 @blacklist = ();
@@ -244,7 +270,7 @@ my $slotsneeded = 0;
 JOB: foreach $jobid (@waiting) {
    print("Processing $jobid(slots=$jobinfo{$jobid}->{slots})\n") if (defined($opts{'d'}));
    my $schedinfo = 0;
-   my $hardqueuelist = "";
+   my @hardqueuelist = ();
    my $error = 0;
    my %hardresource = ();
    my $parallelenvconf = undef;
@@ -252,6 +278,7 @@ JOB: foreach $jobid (@waiting) {
    my $parallelrange = "";
    my $parallelalloc = "";
    my ($perangemin,$perangemax);
+   my $penvfound = "";
    my $woke = 0;
    open(QSTAT,"qstat -j $jobid |");
    while (<QSTAT>) {
@@ -274,20 +301,21 @@ JOB: foreach $jobid (@waiting) {
 
       if (!$schedinfo) {
          if (/^hard_queue_list:\s*(.*)/) {
-            # Record the hard queue list request
-            $hardqueuelist = $1;
             # Strip domain
-            $hardqueuelist =~ s/(@\w+)\.[\w.]+/$1/g if ($hardqueuelist =~ /@/);
+            my $hqlist = $1;
+            $hqlist =~ s/(@\w+)\.[\w.]+/$1/g;
+            @hardqueuelist = split(",",$hqlist);
          } elsif (/^parallel environment:\s*(.*) range:\s*(.*)/) {
             $parallelenv = $1;
-            $parallelrange = $2;
-            ($perangemin,$perangemax) = ($parallelrange =~ /(\d+)-?(\d+)?/);
             $parallelenvconf = loadParallelEnvs($parallelenv) if !defined($parallelenvconf->{$parallelenv});
-            foreach $penv (keys(%$parallelenvconf)) {
+            foreach my $penv (keys(%$parallelenvconf)) {
                $parallelalloc = $parallelenvconf->{$penv}->{"allocation_rule"};
+               print STDERR "Adding parallel env $penv alloc $parallelalloc to job $jobid\n" if (defined($opts{'d'}));
             }
-            $jobinfo{$jobid}->{"slots"} = $perangemin;
-            print STDERR "Setting slots to $jobinfo{$jobid}->{slots} for parallelenv $parallelenv job\n" if (defined($opts{'d'}));
+            ($perangemin,$perangemax) = ($2 =~ /(\d+)-?(\d+)?/);
+            # Try to wake up as many as possible, unless this is an SMP PE request
+            $jobinfo{$jobid}->{"slots"} = (defined($perangemax) and $parallelalloc ne "\$pe_slots") ? $perangemax : $perangemin;
+            print STDERR "Setting slots to $jobinfo{$jobid}->{slots} for parallelenv $parallelenv alloc $parallelalloc\n" if (defined($opts{'d'}));
          }
          next;
       } else {
@@ -297,7 +325,7 @@ JOB: foreach $jobid (@waiting) {
             $queue =~ s/\.[^@]*$//;
 
             # Set the status if it isn't already "up"
-            $status{$queue} = $status; # unless defined($status{$queue});
+            $status{$queue} = $status unless defined($status{$queue});
 
             # Debug
             print "status{$queue} = $status\n" if (defined($opts{'d'}));
@@ -333,88 +361,6 @@ JOB: foreach $jobid (@waiting) {
    $slotsneeded += $jobinfo{$jobid}->{slots};
    next JOB if $slotsneeded < 0;
 
-   # For specific host requests
-   if ($hardqueuelist) {
-      # Debug
-      print("$jobid hardqueuelist=$hardqueuelist\n") if (defined($opts{'d'}));
-
-      QUEUEENTRY: foreach $hardqueueentry (split(",",$hardqueuelist)) {
-         if ($hardqueueentry !~ /@/) {
-            # If only requesting a queue, find all hosts in that queue
-            @hardqueuehosts = grep($_ =~ /^$hardqueueentry@/,keys(%status));
-         } else {
-            @hardqueuehosts = ($hardqueueentry);
-         }
-         print "$jobid hardquehosts=" . join(",",@hardqueuehosts) . "\n" if defined($opts{'d'});
-         # Wakeup hosts in wakeupHosts order
-         QUEUEHOST: foreach my $hardqueuehost (map { my $b = $_; grep { $_ =~ /\@$b$/ } @hardqueuehosts } @wakeupHosts) {
-            my ($queue,$host) = ($hardqueuehost =~ /(.+)@(.+)/);
-            # Debug
-            print("$jobid hardqueuehost=$hardqueuehost status=$status{$hardqueuehost}\n") if (defined($opts{'d'}));
-
-            # Skip queue if it is the wrong type
-            if ($parallelenv eq "" and $queuetype{$queue} !~ /B/) {
-               print("$jobid Skipping $hardqueuehost because it is not of type batch\n");
-               next QUEUEHOST
-            }
-            if ($parallelenv ne "" and $queuetype{$queue} !~ /P/) {
-               print("$jobid Skipping $hardqueuehost because it is not of type parallel\n");
-               next QUEUEHOST
-            }
-
-            # Wake it up if unavailable, we haven't already done so, and it's in the list of hosts to wake up
-            if (defined($status{$hardqueuehost}) &&
-                $status{"$hardqueuehost"} eq "temporarily not available" &&
-                !grep($_ eq $host,@wokenhosts) && grep($_ eq $host,@wakeupHosts) &&
-                $host ne $lastwake) {
-               # Handle parallel environment requests
-               if ($parallelenv ne "") {
-                  if ($parallelalloc eq '$pe_slots') {
-                     if ($perangemin > $qhresource{$hardqueuehost}->{"slots"}) {
-                        print STDERR "Skipping $host because parallel env $parallelenv needs $perangemin slots > " . $qhresource{$hardqueuehost}->{"slots"} . "\n" if (defined($opts{'d'}));
-                        next QUEUEHOST;
-                     }
-                  }
-               }
-
-               print("Waking up $host for $hardqueueentry, slots = ". $qhresource{$hardqueuehost}->{"slots"} . ", status=$status{$hardqueuehost}, slots needed = $slotsneeded\n") if ($jobinfo{$jobid}->{"user"} ne "root" or defined($opts{'d'}));
-               system("$wakeupcmd $host") unless defined($opts{'d'});
-               $woke++;
-               push(@wokenhosts,$host);
-
-               # Record that last host woken up
-               open(LAST,"> /var/lib/gewake/last") or die;
-               print LAST "$host\n";
-               close(LAST);
-
-               # See if we need more slots
-               $slotsneeded -= $qhresource{$hardqueuehost}->{"slots"};
-               print("slots needed = $slotsneeded\n") if (defined($opts{'d'}));
-
-               # If we still need more slots, sleep a bit to stagger power ups
-               # then try another host
-               if ($slotsneeded > 0) {
-                  sleep(15);
-                  next QUEUEHOST;
-               } else {
-                  next JOB;
-               }
-
-               # Sleep a bit to stagger power ups
-               sleep(15);
-               ## Quit to let the host(s) come up and jobs get scheduled to it
-               #exit(0);
-            } else {
-               # Try the next entry in the hardquelist
-               next QUEUEHOST;
-            }
-         }
-      }
-
-      # Go to the next job
-      next JOB;
-   }
-
    # Go through the list of wakeupHosts in order and wake up if needed
    HOST: foreach $host (@wakeupHosts) {
       # We may not have any queues because they may be disabled
@@ -423,25 +369,38 @@ JOB: foreach $jobid (@waiting) {
       # Skip if we've already tried to wake it up
       next if grep($_ eq $host,@wokenhosts);
 
-      # regexp for all of the queues we have access to
-      my $queuematch = join("|",grep {!defined($status{$_}) or $status{$_} ne "noaccess"} @{$queuesForHost{$host}});
-
       # Loop through the queues
       QUEUE: foreach my $queue (@{$queuesForHost{$host}}) {
       #print STDERR "No queue for host $host\n" if !defined($queue);
+         my $queuehost = "$queue\@$host";
 
          # Debug
-         print "host=$host queuematch=$queuematch $queue status{${queue}\@${host}}=" . $status{"$queue\@$host"} . "\n" if (defined($opts{'d'}));
+         print "Checking $queuehost status{$queuehost}=" . $status{$queuehost} . "\n" if (defined($opts{'d'}));
+
+         # Skip queue if not in hardqueuelist
+         if (@hardqueuelist) {
+            my $hardqueuematched = 0;
+            QUEUEENTRY: foreach my $hardqueueentry (@hardqueuelist) {
+               $hardqueuematched = 1 if $hardqueueentry eq $queue or $hardqueueentry eq $queuehost;
+            }
+            if (!$hardqueuematched) {
+               print "Skipping $queuehost not in hardqueuelist " . join(",",@hardqueuelist) . "\n" if (defined($opts{'d'}));
+               next QUEUE;
+            }
+         }
 
          # Skip queue if it is the wrong type
-         next QUEUE if $parallelenv eq "" and $queuetype{$queue} !~ /B/;
-         next QUEUE if $parallelenv ne "" and $queuetype{$queue} !~ /P/;
+         if ($parallelenv eq "" and $queuetype{$queue} !~ /B/) {
+            print("$jobid Skipping $queue because it is not of type batch\n") if (defined($opts{'d'}));
+            next QUEUE
+         }
+         if ($parallelenv ne "" and $queuetype{$queue} !~ /P/) {
+            print("$jobid Skipping $queue because it is not of type parallel\n") if (defined($opts{'d'}));
+            next QUEUE
+         }
 
-         # Wakeup if we don't have a hard queue list or it's in our hard queue list,
-         # and the host is down
-         if (($hardqueuelist eq "" || $hardqueuelist =~ /($queuematch)/) &&
-             defined($status{"$queue\@$host"}) &&
-             $status{"$queue\@$host"} eq "temporarily not available") {
+         # Wakeup if the host is down
+         if (defined($status{$queuehost}) && $status{$queuehost} eq "temporarily not available") {
             if (grep(/^$host$/,@blacklist)) {
                #Blacklisted, skip
                print STDERR "Skipping blacklisted host $host\n" if (defined($opts{'d'}));
@@ -457,16 +416,16 @@ JOB: foreach $jobid (@waiting) {
                # Check hard resources using the appropriate complex method
                foreach $resource (sort(keys(%hardresource))) {
                   print STDERR "Checking resource requirement $resource: " if (defined($opts{'d'}));
-                  if (defined($qhresource{"$queue\@$host"}->{$resource})) {
+                  if (defined($qhresource{$queuehost}->{$resource})) {
                      my $thishardresource = $hardresource{$resource};
                      # Booleans are reported as numeric, but can be specified as true/false
                      $thishardresource =~ s/true/1.000000/;
-                     print STDERR "next HOST if !($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $jobinfo{$jobid}->{slots}" : "") . ") $complex{$resource}->{relop} " . $qhresource{"$queue\@$host"}->{$resource} . ")\n" if (defined($opts{'d'}));
+                     print STDERR "next HOST if !($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $jobinfo{$jobid}->{slots}" : "") . ") $complex{$resource}->{relop} " . $qhresource{$queuehost}->{$resource} . ")\n" if (defined($opts{'d'}));
                      if ($complex{$resource}->{'relop'} eq "eq") {
                         # Need to quote strings
-                        next HOST if eval "!(\"$thishardresource\" $complex{$resource}->{'relop'} \"$qhresource{\"$queue\@$host\"}->{$resource}\") ";
+                        next HOST if eval "!(\"$thishardresource\" $complex{$resource}->{'relop'} \"$qhresource{$queuehost}->{$resource}\") ";
                      } else {
-                        next HOST if eval "!(($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $jobinfo{$jobid}->{slots}" : "") . ") $complex{$resource}->{'relop'} $qhresource{\"$queue\@$host\"}->{$resource})";
+                        next HOST if eval "!(($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $jobinfo{$jobid}->{slots}" : "") . ") $complex{$resource}->{'relop'} $qhresource{$queuehost}->{$resource})";
                      }
                   } else {
                      next HOST;
@@ -476,14 +435,34 @@ JOB: foreach $jobid (@waiting) {
                # Handle parallel environment requests
                if ($parallelenv ne "") {
                   if ($parallelalloc eq '$pe_slots') {
-                     if ($perangemin > $qhresource{"$queue\@$host"}->{"slots"}) {
-                        print STDERR "Skipping $host because parallel env $parallelenv needs $perangemin slots > " . $qhresource{"$queue\@$host"}->{"slots"} . "\n" if (defined($opts{'d'}));
+                     if ($perangemin > $qhresource{$queuehost}->{"slots"}) {
+                        print STDERR "Skipping $host because parallel env $parallelenv needs $perangemin slots > " . $qhresource{$queuehost}->{"slots"} . "\n" if (defined($opts{'d'}));
                         next HOST;
                      }
                   }
+                  my @parallelenvs = keys(%$parallelenvconf);
+                  @parallelenvs = ($penvfound) if $penvfound;
+                  my $thispenvfound = 0;
+                  PENV: foreach my $penv (@parallelenvs) {
+                     print STDERR "Checking parallel env $penv for $queuehost\n" if (defined($opts{'d'}));
+                     if (!defined($parallelenvconf->{$penv}->{'hostqueues'}->{$queuehost})) {
+                           print STDERR "Skipping $queuehost because it does not contain parallel env $penv\n" if (defined($opts{'d'}));
+                           next PENV;
+                     } elsif ($perangemin > $parallelenvconf->{$penv}->{'hostqueues'}->{$queue}) {
+                           print STDERR "Skipping $queue because parallel env $penv needs $perangemin slots > " . $parallelenvconf->{$penv}->{'hostqueues'}->{$queue} . "\n" if (defined($opts{'d'}));
+                           next PENV;
+                     }
+                     $thispenvfound = $penvfound = $penv;
+                     print STDERR "Selecting parallel env $penv for $queuehost\n" if (defined($opts{'d'}));
+                     last PENV;
+                  }
+                  if (!$thispenvfound) {
+                     print STDERR "Skipping host $host because no suitable parallel env found\n" if (defined($opts{'d'}));
+                     next HOST;
+                  }
                }
 
-               print("Waking up $host for queue $queue, slots = ". $qhresource{"$queue\@$host"}->{"slots"} . ", status = " . $status{"$queue\@$host"} . ", slots needed = $slotsneeded\n") unless $jobinfo{$jobid}->{"user"} eq "root";
+               print("Waking up $host for jobid $jobid on queue $queue, slots = ". $qhresource{$queuehost}->{"slots"} . ", status = " . $status{$queuehost} . ", slots needed = $slotsneeded\n") unless $jobinfo{$jobid}->{"user"} eq "root";
                system("$wakeupcmd $host") unless defined($opts{'d'});
                $woke++;
                push(@wokenhosts,$host);
@@ -493,14 +472,14 @@ JOB: foreach $jobid (@waiting) {
                print LAST "$host\n";
                close(LAST);
 
-               # Redeuce the slots needed by the slots provided by this host
-               $slotsneeded -= $qhresource{"$queue\@$host"}->{"slots"};
+               # Reduce the slots needed by the slots provided by this host
+               $slotsneeded -= $qhresource{$queuehost}->{"slots"};
                print("slots needed = $slotsneeded\n") if (defined($opts{'d'}));
 
                # If we still need more slots, sleep a bit to stagger power ups
                # then try another host
                if ($slotsneeded > 0) {
-                  sleep(15);
+                  sleep(5);
                   next HOST;
                } else {
                   next JOB;
@@ -509,10 +488,10 @@ JOB: foreach $jobid (@waiting) {
                # Quit to let the host(s) come up and jobs get scheduled to it
                exit(0);
             }
-#         } elsif ($status{"$queue\@$host"} eq "up") {
+#         } elsif ($status{$queuehost} eq "up") {
 #               # Redeuce the slots needed by the slots provided by this host
-#               print("Reducing needs slots by " . $qhresource{"$queue\@$host"}->{"slots"} . " for up host $host\n") if (defined($opts{'d'}));
-#               $jobinfo{$jobid}->{"slots"} -= $qhresource{"$queue\@$host"}->{"slots"};
+#               print("Reducing needs slots by " . $qhresource{$queuehost}->{"slots"} . " for up host $host\n") if (defined($opts{'d'}));
+#               $jobinfo{$jobid}->{"slots"} -= $qhresource{$queuehost}->{"slots"};
 #               print("slots left = " . $jobinfo{$jobid}->{"slots"} . "\n") if (defined($opts{'d'}));
          }
 
