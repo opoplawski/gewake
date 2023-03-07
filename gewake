@@ -37,6 +37,18 @@ sub memValue {
    return $arg;
 }
 
+sub isJobHeld {
+   my ($jobid) = @_;
+   my $held = 0;
+
+   open(QSTATH,"qstat -j $jobid |");
+   while (<QSTATH>) {
+      $held = 1 if /Job is in hold state/;
+   }
+   close(QSTATH);
+   return $held;
+}
+
 # Load a parallel environment
 sub loadParallelEnv {
    my ($envname) = @_;
@@ -98,7 +110,7 @@ sub loadParallelEnvs {
    return \%envconf;
 }
 
-my $version = "1.4";
+my $version = "1.6";
 my $wakehostsfile = "/usr/local/etc/gewake.hosts";
 my $wakeupcmd = "/usr/local/bin/wakeup";
 my %status = ();
@@ -121,45 +133,60 @@ close(HOSTS);
 
 # See if there are any waiting jobs
 #job-ID  prior   name       user         state submit/start at     queue                 slots ja-task-ID
-
-open(QSTAT,'qstat -u \* |');
-my $now = new Date::Manip::Date("now");
 my %jobinfo;
-while (<QSTAT>) {
-   chomp;
-   my ($jobid,$prior,$name,$user,$state,$submitdate,$submittime,$slots,$tasklist) = split;
-   if (defined($state) && $state =~ /q/ && $state !~ /E/) {
-      # Determine how many seconds ago the job was submitted
-      my $subdate = new Date::Manip::Date("$submitdate $submittime");
-      my $seconds = $now->calc($subdate, 1)->printf('%sys');
-
-      # Wait for 60 seconds for scheduler to process new jobs
-      if ($seconds > 60 or defined($opts{'d'})) {
-         push(@waiting,$jobid);
-
-         #Track some other info
-         my $numtasks = 0;
-         print "$jobid slots=$slots, tasklist=$tasklist" if (defined($opts{'d'}));
-         if (defined($tasklist) and $tasklist ne "") {
-            $jobinfo{$jobid}->{"tasklist"} = $tasklist;
-            foreach $taskentry (split(",",$tasklist)) {
-               my ($starttask,$endtask,$stride);
-               if (($starttask,$endtask,$stride) = ($taskentry =~ /(\d+)-(\d+):(\d+)/)) {
-                  $numtasks += ($endtask-$starttask+1)/$stride;
-               } elsif ($taskentry =~ /^\d+$/) {
-                  $numtasks++;
-               }
-            }
-         } else {
-            $numtasks = 1;
+my $hold;
+my $tries = 0;
+do {
+   $hold = 0;
+   open(QSTAT,'qstat -u \* |');
+   my $now = new Date::Manip::Date("now");
+   while (<QSTAT>) {
+      chomp;
+      my ($jobid,$prior,$name,$user,$state,$submitdate,$submittime,$slots,$tasklist) = split;
+      if (defined($state) && $state =~ /h/ && $state !~ /E/) {
+         # Job is in hold state - see if it is due to us
+         if (&isJobHeld($jobid)) {
+            $hold = 1;
+            # If it is, just release it for now
+            print("Releasing hold on $jobid: ");
+            system("qrls $jobid");
          }
-         print "($numtasks)\n" if (defined($opts{'d'}));
-         $jobinfo{$jobid}->{"slots"} = $slots * $numtasks;
-         $jobinfo{$jobid}->{"user"} = $user;
+      } elsif (defined($state) && $state =~ /q/ && $state !~ /E/) {
+         # Determine how many seconds ago the job was submitted
+         my $subdate = new Date::Manip::Date("$submitdate $submittime");
+         my $seconds = $now->calc($subdate, 1)->printf('%sys');
+
+         # Wait for 60 seconds for scheduler to process new jobs
+         if ($seconds > 60 or defined($opts{'d'})) {
+            push(@waiting,$jobid);
+
+            #Track some other info
+            my $numtasks = 0;
+         print "$jobid slots=$slots, tasklist=$tasklist" if (defined($opts{'d'}));
+            if (defined($tasklist) and $tasklist ne "") {
+               $jobinfo{$jobid}->{"tasklist"} = $tasklist;
+               foreach $taskentry (split(",",$tasklist)) {
+                  my ($starttask,$endtask,$stride);
+                  if (($starttask,$endtask,$stride) = ($taskentry =~ /(\d+)-(\d+):(\d+)/)) {
+                     $numtasks += ($endtask-$starttask+1)/$stride;
+                  } elsif ($taskentry =~ /^\d+$/) {
+                     $numtasks++;
+                  }
+               }
+            } else {
+               $numtasks = 1;
+            }
+            print "($numtasks)\n" if (defined($opts{'d'}));
+            $jobinfo{$jobid}->{"slots"} = $slots * $numtasks;
+            $jobinfo{$jobid}->{"user"} = $user;
+         }
       }
    }
-}
-close(QSTAT);
+   close(QSTAT);
+   $tries++;
+   # Let released jobs get scheduled if possible
+   sleep(10) if $hold;
+} while ($hold and $tries < 10);
 
 # Open status files
 # Last host we tried to wake up
@@ -199,6 +226,14 @@ my ($queue,$host);
 while (<QSTAT>) {
    chomp;
    if (/@/) {
+      #if ($opts{'d'} and $queue) {
+      #   print "$queue\@$host: ";
+      #   foreach my $resource (keys(%{$qhresource{"$queue\@$host"}})) {
+      #      print "$resource=" . $qhresource{"$queue\@$host"}->{$resource} . ", ";
+      #   }
+      #   print "\n";
+      #}
+
       my ($queueent,$qtype,$slots,$loadave,$arch,$state) = split;
       # Strip domain
       $queueent =~ s/\.[^@]*$//;
@@ -222,15 +257,13 @@ while (<QSTAT>) {
          $status{$queueent} = "suspended";
       }
 
-      # Record number of slots in the queue entry
-      $qhresource{$queueent}->{"slots"} = $slots;
-
       # Record queue type
       $queuetype{$queue} = $qtype
    } elsif (my ($type,$resource,$value) = /(\w\w):(\S+)=(\S+)/) {
       # Parse the resources for the queue
       print STDERR "Cannot parse $_ for resources\n" unless defined($resource);
       if ($resource =~ /^mem_/) { $value = &memValue($value); }
+      $value =~ s/infinity/Infinity/;
       $qhresource{"$queue\@$host"}->{$resource} = $value;
    }
 }
@@ -238,7 +271,7 @@ close(QSTAT);
 
 # Get information on complexes
 # qconf -sc
-#  #name               shortcut    type        relop requestable consumable default  urgency 
+#  #name               shortcut    type        relop requestable consumable default  urgency
 #  #-----------------------------------------------------------------------------------------
 #  arch                a           RESTRING    ==    YES         NO         NONE     0
 my (%complex);
@@ -267,6 +300,8 @@ while (<QCONF>) {
 #                   cannot run in queue "queue" because it is not contained in its hard queue list (-q)
 my @wokenhosts = ();
 my $slotsneeded = 0;
+my $woke = 0;
+my $holdneeded = 0;
 JOB: foreach $jobid (@waiting) {
    print("Processing $jobid(slots=$jobinfo{$jobid}->{slots})\n") if (defined($opts{'d'}));
    my $schedinfo = 0;
@@ -279,12 +314,16 @@ JOB: foreach $jobid (@waiting) {
    my $parallelalloc = "";
    my ($perangemin,$perangemax);
    my $penvfound = "";
-   my $woke = 0;
+   $holdneeded = 0;
+   $woke = 0;
    open(QSTAT,"qstat -j $jobid |");
-   while (<QSTAT>) {
+   QSTATLINE: while (<QSTAT>) {
       chomp;
       # Job is in error state
-      $error = 1 if /^error reason/;
+      if (/^error reason/) {
+         $error = 1;
+         next QSTATLINE;
+      }
 
       # Get the hard resources to see if we can avoid waking up machines that
       # don't satisfy them
@@ -294,6 +333,7 @@ JOB: foreach $jobid (@waiting) {
             if ($resource =~ /^mem_/) { $value = &memValue($value); }
             $hardresource{$resource} = $value;
          }
+         next QSTATLINE;
       }
 
       # Signal start of scheduling info parsing
@@ -305,19 +345,24 @@ JOB: foreach $jobid (@waiting) {
             my $hqlist = $1;
             $hqlist =~ s/(@\w+)\.[\w.]+/$1/g;
             @hardqueuelist = split(",",$hqlist);
+            next QSTATLINE;
          } elsif (/^parallel environment:\s*(.*) range:\s*(.*)/) {
             $parallelenv = $1;
             $parallelenvconf = loadParallelEnvs($parallelenv) if !defined($parallelenvconf->{$parallelenv});
             foreach my $penv (keys(%$parallelenvconf)) {
-               $parallelalloc = $parallelenvconf->{$penv}->{"allocation_rule"};
-               print STDERR "Adding parallel env $penv alloc $parallelalloc to job $jobid\n" if (defined($opts{'d'}));
+               # Only set parallelalloc to $pe_slots if ALL PEs are $pe_slots
+               if ($parallelalloc eq "" or $parallelalloc eq '$pe_slots') {
+                  $parallelalloc = $parallelenvconf->{$penv}->{"allocation_rule"};
+                  print STDERR "Adding parallel env $penv alloc $parallelalloc to job $jobid\n" if (defined($opts{'d'}));
+               }
             }
             ($perangemin,$perangemax) = ($2 =~ /(\d+)-?(\d+)?/);
             # Try to wake up as many as possible, unless this is an SMP PE request
             $jobinfo{$jobid}->{"slots"} = (defined($perangemax) and $parallelalloc ne "\$pe_slots") ? $perangemax : $perangemin;
             print STDERR "Setting slots to $jobinfo{$jobid}->{slots} for parallelenv $parallelenv alloc $parallelalloc\n" if (defined($opts{'d'}));
+            next QSTATLINE;
          }
-         next;
+         next QSTATLINE;
       } else {
          my $junk;
          if (($queue,$status) = /queue instance "(.+)" (?:dropped |)because it is (.+)/) {
@@ -329,6 +374,7 @@ JOB: foreach $jobid (@waiting) {
 
             # Debug
             print "status{$queue} = $status\n" if (defined($opts{'d'}));
+            next QSTATLINE;
          } elsif (($queue,$status) = /queue instance "(.+)" is in (.+)/) {
             # Strip domain
             $queue =~ s/\.[^@]*$//;
@@ -338,6 +384,7 @@ JOB: foreach $jobid (@waiting) {
 
             # Debug
             print "status{$queue} = $status\n" if (defined($opts{'d'}));
+            next QSTATLINE;
          } elsif (($queue) = /has no permission for cluster queue "(.+)"/) {
             # Strip domain
             $queue =~ s/\.[^@]*$//;
@@ -347,9 +394,11 @@ JOB: foreach $jobid (@waiting) {
 
             # Debug
             print "status{$queue} = $status{$queue}\n" if (defined($opts{'d'}));
+            next QSTATLINE;
          } else {
             # We don't think we care about anything else, but list it if debugging
             print "Unknown status line: $_\n" if (defined($opts{'d'}));
+            next QSTATLINE;
          }
       }
    }
@@ -358,10 +407,13 @@ JOB: foreach $jobid (@waiting) {
    # Don't process error state jobs
    next if $error;
 
+   # TODO - keeps track of slots per host
    $slotsneeded += $jobinfo{$jobid}->{slots};
    next JOB if $slotsneeded < 0;
 
    # Go through the list of wakeupHosts in order and wake up if needed
+   my @hostsToWake = ();
+   $jobslotsneeded = $jobinfo{$jobid}->{slots};
    HOST: foreach $host (@wakeupHosts) {
       # We may not have any queues because they may be disabled
       next if !defined($queuesForHost{$host});
@@ -420,12 +472,16 @@ JOB: foreach $jobid (@waiting) {
                      my $thishardresource = $hardresource{$resource};
                      # Booleans are reported as numeric, but can be specified as true/false
                      $thishardresource =~ s/true/1.000000/;
-                     print STDERR "next HOST if !($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $jobinfo{$jobid}->{slots}" : "") . ") $complex{$resource}->{relop} " . $qhresource{$queuehost}->{$resource} . ")\n" if (defined($opts{'d'}));
+                     my $slots = ($jobinfo{$jobid}->{slots} > $qhresource{$queuehost}->{'slots'}) ? $qhresource{$queuehost}->{'slots'} : $jobinfo{$jobid}->{slots};
+                     # TODO - This isn't "MEMORY" per se but consumable "YES" vs "JOB", but possibly only for MEMORY types
+                     #print STDERR "next HOST if !($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $slots" : "") . ") $complex{$resource}->{relop} " . $qhresource{$queuehost}->{$resource} . ")\n" if (defined($opts{'d'}));
+                     print STDERR "next HOST if !($thishardresource) $complex{$resource}->{relop} " . $qhresource{$queuehost}->{$resource} . ")\n" if (defined($opts{'d'}));
                      if ($complex{$resource}->{'relop'} eq "eq") {
                         # Need to quote strings
                         next HOST if eval "!(\"$thishardresource\" $complex{$resource}->{'relop'} \"$qhresource{$queuehost}->{$resource}\") ";
                      } else {
-                        next HOST if eval "!(($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $jobinfo{$jobid}->{slots}" : "") . ") $complex{$resource}->{'relop'} $qhresource{$queuehost}->{$resource})";
+                        #next HOST if eval "!(($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $slots" : "") . ") $complex{$resource}->{'relop'} $qhresource{$queuehost}->{$resource})";
+                        next HOST if eval "!(($thishardresource) $complex{$resource}->{'relop'} $qhresource{$queuehost}->{$resource})";
                      }
                   } else {
                      next HOST;
@@ -462,43 +518,57 @@ JOB: foreach $jobid (@waiting) {
                   }
                }
 
-               print("Waking up $host for jobid $jobid on queue $queue, slots = ". $qhresource{$queuehost}->{"slots"} . ", status = " . $status{$queuehost} . ", slots needed = $slotsneeded\n") unless $jobinfo{$jobid}->{"user"} eq "root";
-               system("$wakeupcmd $host") unless defined($opts{'d'});
-               $woke++;
-               push(@wokenhosts,$host);
+               print("Queing wake up of $host for jobid $jobid on queue $queue,") if defined($opts{'d'});
+               print(" pe = $penvfound,") if $penvfound and defined($opts{'d'});
+               print(" slots = ". $qhresource{$queuehost}->{"slots"} . ", status = " . $status{$queuehost} . ", slots needed = $slotsneeded\n") if defined($opts{'d'});
 
-               # Record that last host woken up
-               open(LAST,"> /var/lib/gewake/last") or die;
-               print LAST "$host\n";
-               close(LAST);
+               # Add to list of hosts to wake
+               push(@hostsToWake,$host);
+
+               # If this is a multi-host parallel job with a range of slots, try to wait until all hosts are awake
+               if ($penvfound and $parallelalloc and $parallelalloc ne '$pe_slots' and defined($perangemax)) {
+                  print(" setting holdneeded\n") if defined($opts{'d'});
+                  $holdneeded = 1;
+               }
 
                # Reduce the slots needed by the slots provided by this host
                $slotsneeded -= $qhresource{$queuehost}->{"slots"};
-               print("slots needed = $slotsneeded\n") if (defined($opts{'d'}));
+               $jobslotsneeded -= $qhresource{$queuehost}->{"slots"};
+               print("slots needed = $slotsneeded, jobslotsneeded = $jobslotsneeded\n") if (defined($opts{'d'}));
 
-               # If we still need more slots, sleep a bit to stagger power ups
-               # then try another host
-               if ($slotsneeded > 0) {
-                  sleep(5);
-                  next HOST;
-               } else {
-                  next JOB;
-               }
+               # Stop looking for hosts if we have enough for this job
+               last HOST if $jobslotsneeded <= 0;
 
-               # Quit to let the host(s) come up and jobs get scheduled to it
-               exit(0);
+               # Avoid any other queues on this host
+               next HOST;
             }
-#         } elsif ($status{$queuehost} eq "up") {
-#               # Redeuce the slots needed by the slots provided by this host
-#               print("Reducing needs slots by " . $qhresource{$queuehost}->{"slots"} . " for up host $host\n") if (defined($opts{'d'}));
-#               $jobinfo{$jobid}->{"slots"} -= $qhresource{$queuehost}->{"slots"};
-#               print("slots left = " . $jobinfo{$jobid}->{"slots"} . "\n") if (defined($opts{'d'}));
-         }
-
-         if ($jobinfo{$jobid}->{"slots"} <= 0) {
-            print("Giving up on job $jobid, no more slots needed\n") if (defined($opts{'d'}));
-            next JOB;
          }
       }
+   }
+
+   # If we are not a parallel job, or if we can wake up enough hosts, or if we just want as many as possible...
+   if ($parallelenv eq "" or $jobslotsneeded <= 0 or $jobslotsneeded > 9000000) {
+      HOST: foreach $host (@hostsToWake) {
+         print("Waking up $host\n") if ($jobinfo{$jobid}->{"user"} ne "root");
+         system("$wakeupcmd $host") unless defined($opts{'d'});
+         $woke++;
+         push(@wokenhosts,$host);
+
+         # Record that last host woken up
+         open(LAST,"> /var/lib/gewake/last") or die;
+         print LAST "$host\n";
+         close(LAST);
+
+         # Sleep a bit to stagger power ups
+         sleep(5);
+      }
+   } else {
+      print "Skipping jobid $jobid, still need $jobslotsneeded slots for parallel job\n" if defined($opts{'d'});
+   }
+} continue {
+   # Place a job hold if waking up multiple hosts
+   if ($holdneeded and $woke > 1) {
+      print("Placing hold on $jobid: ");
+      system("qhold -o u $jobid");
    }
 }
