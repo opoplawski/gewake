@@ -110,7 +110,7 @@ sub loadParallelEnvs {
    return \%envconf;
 }
 
-my $version = "1.6";
+my $version = "1.7";
 my $wakehostsfile = "/usr/local/etc/gewake.hosts";
 my $wakeupcmd = "/usr/local/bin/wakeup";
 my %status = ();
@@ -219,6 +219,27 @@ if (defined($opts{'d'}) and @waiting) {
   print "Waiting: " . join(",",@waiting) . "\n";
 }
 
+# Get information on complexes
+# qconf -sc
+#  #name               shortcut    type        relop requestable consumable default  urgency
+#  #-----------------------------------------------------------------------------------------
+#  arch                a           RESTRING    ==    YES         NO         NONE     0
+my (%complex);
+open(QCONF,'qconf -sc |') or die 'Cannot run qconf -sc';
+while (<QCONF>) {
+   next if /^#/;
+   chomp;
+   my ($name,$shortcut,$type,$relop,$req,$con,$default,$urgency) = split(" ");
+   # Only need requestable ones
+   if ($req eq "YES" or $req eq "FORCED") {
+      $complex{$name}->{"type"} = $type;
+      # Modify operator for string comparisons
+      if ($type eq "RESTRING") { $relop = "eq" };
+      $complex{$name}->{"relop"} = $relop;
+      print "complex: $name $type $relop\n" if defined($opts{'d'});
+   }
+}
+
 # Collect queue information
 #queuename                      qtype used/tot. load_avg arch          states
 open(QSTAT,'qstat -f -F|');
@@ -262,33 +283,12 @@ while (<QSTAT>) {
    } elsif (my ($type,$resource,$value) = /(\w\w):(\S+)=(\S+)/) {
       # Parse the resources for the queue
       print STDERR "Cannot parse $_ for resources\n" unless defined($resource);
-      if ($resource =~ /^mem_/) { $value = &memValue($value); }
+      if (defined($complex{$resource}) and $complex{$resource}->{"type"} eq "MEMORY") { $value = &memValue($value); }
       $value =~ s/infinity/Infinity/;
       $qhresource{"$queue\@$host"}->{$resource} = $value;
    }
 }
 close(QSTAT);
-
-# Get information on complexes
-# qconf -sc
-#  #name               shortcut    type        relop requestable consumable default  urgency
-#  #-----------------------------------------------------------------------------------------
-#  arch                a           RESTRING    ==    YES         NO         NONE     0
-my (%complex);
-open(QCONF,'qconf -sc |') or die 'Cannot run qconf -sc';
-while (<QCONF>) {
-   next if /^#/;
-   chomp;
-   my ($name,$shortcut,$type,$relop,$req,$con,$default,$urgency) = split(" ");
-   # Only need requestable ones
-   if ($req eq "YES" or $req eq "FORCED") {
-      $complex{$name}->{"type"} = $type;
-      # Modify operator for string comparisons
-      if ($type eq "RESTRING") { $relop = "eq" };
-      $complex{$name}->{"relop"} = $relop;
-      print "complex: $name $type $relop\n" if defined($opts{'d'});
-   }
-}
 
 # See why the jobs are waiting
 # qstat -j output:
