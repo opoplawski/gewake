@@ -110,7 +110,7 @@ sub loadParallelEnvs {
    return \%envconf;
 }
 
-my $version = "1.7";
+my $version = "1.8";
 my $wakehostsfile = "/usr/local/etc/gewake.hosts";
 my $wakeupcmd = "/usr/local/bin/wakeup";
 my %status = ();
@@ -127,7 +127,9 @@ open(HOSTS,"< $wakehostsfile") or die "Cannot open $wakehostsfile";
 while (<HOSTS>) {
    chomp;
    s/#.*//;
-   push(@wakeupHosts,$_) if $_;
+   my ($hostname,$wait) = split;
+   push(@wakeupHosts,$hostname) if $hostname;
+   $wakeupHostsWait{$hostname} = $wait if $wait;
 }
 close(HOSTS);
 
@@ -149,7 +151,7 @@ do {
             $hold = 1;
             # If it is, just release it for now
             print("Releasing hold on $jobid: ");
-            system("qrls $jobid");
+            system("qrls $jobid") unless defined($opts{'d'});
          }
       } elsif (defined($state) && $state =~ /q/ && $state !~ /E/) {
          # Determine how many seconds ago the job was submitted
@@ -189,12 +191,19 @@ do {
 } while ($hold and $tries < 10);
 
 # Open status files
-# Last host we tried to wake up
-$lastwake = "";
+# Last hosts we tried to wake up and wait timer - we want to clear this if there are no
+# waiting jobs so run before the no waiting jobs check below
+my %lastwake;
 if (-f "/var/lib/gewake/last") {
-   chomp($lastwake = `cat /var/lib/gewake/last`);
+   open(LAST,"< /var/lib/gewake/last") or die "Cannot open /var/lib/gewake/last";
+   while (<LAST>) {
+      chomp;
+      my ($hostname,$wait) = split;
+      $lastwake{$hostname} = $wait;
+   }
+   close(LAST);
    # clear the last woken up hosts status file
-   unlink("/var/lib/gewake/last");
+   unlink("/var/lib/gewake/last") unless defined($opts{'d'});
 }
 
 # Quit if no waiting jobs
@@ -300,7 +309,10 @@ close(QSTAT);
 #                   cannot run in queue "queue" because it is not contained in its hard queue list (-q)
 my @wokenhosts = ();
 my $slotsneeded = 0;
+# Number of hosts woken for this job
 my $woke = 0;
+# Hosts who have had their wakeup counter decremented
+my %lastwakedecremented;
 my $holdneeded = 0;
 JOB: foreach $jobid (@waiting) {
    print("Processing $jobid(slots=$jobinfo{$jobid}->{slots})\n") if (defined($opts{'d'}));
@@ -453,71 +465,81 @@ JOB: foreach $jobid (@waiting) {
 
          # Wakeup if the host is down
          if (defined($status{$queuehost}) && $status{$queuehost} eq "temporarily not available") {
+            # Check hard resources using the appropriate complex method
+            foreach $resource (sort(keys(%hardresource))) {
+               print STDERR "Checking resource requirement $resource: " if (defined($opts{'d'}));
+               if (defined($qhresource{$queuehost}->{$resource})) {
+                  my $thishardresource = $hardresource{$resource};
+                  # Booleans are reported as numeric, but can be specified as true/false
+                  $thishardresource =~ s/true/1.000000/;
+                  my $slots = ($jobinfo{$jobid}->{slots} > $qhresource{$queuehost}->{'slots'}) ? $qhresource{$queuehost}->{'slots'} : $jobinfo{$jobid}->{slots};
+                  # TODO - This isn't "MEMORY" per se but consumable "YES" vs "JOB", but possibly only for MEMORY types
+                  #print STDERR "next HOST if !($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $slots" : "") . ") $complex{$resource}->{relop} " . $qhresource{$queuehost}->{$resource} . ")\n" if (defined($opts{'d'}));
+                  print STDERR "next HOST if !($thishardresource) $complex{$resource}->{relop} " . $qhresource{$queuehost}->{$resource} . ")\n" if (defined($opts{'d'}));
+                  if ($complex{$resource}->{'relop'} eq "eq") {
+                     # Need to quote strings
+                     next HOST if eval "!(\"$thishardresource\" $complex{$resource}->{'relop'} \"$qhresource{$queuehost}->{$resource}\") ";
+                  } else {
+                     #next HOST if eval "!(($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $slots" : "") . ") $complex{$resource}->{'relop'} $qhresource{$queuehost}->{$resource})";
+                     next HOST if eval "!(($thishardresource) $complex{$resource}->{'relop'} $qhresource{$queuehost}->{$resource})";
+                  }
+               } else {
+                  next HOST;
+               }
+            }
+
+            # Handle parallel environment requests
+            if ($parallelenv ne "") {
+               if ($parallelalloc eq '$pe_slots') {
+                  if ($perangemin > $qhresource{$queuehost}->{"slots"}) {
+                     print STDERR "Skipping $host because parallel env $parallelenv needs $perangemin slots > " . $qhresource{$queuehost}->{"slots"} . "\n" if (defined($opts{'d'}));
+                     next HOST;
+                  }
+               }
+               my @parallelenvs = keys(%$parallelenvconf);
+               @parallelenvs = ($penvfound) if $penvfound;
+               my $thispenvfound = 0;
+               PENV: foreach my $penv (@parallelenvs) {
+                  print STDERR "Checking parallel env $penv for $queuehost\n" if (defined($opts{'d'}));
+                  if (!defined($parallelenvconf->{$penv}->{'hostqueues'}->{$queuehost})) {
+                        print STDERR "Skipping $queuehost because it does not contain parallel env $penv\n" if (defined($opts{'d'}));
+                        next PENV;
+                  } elsif ($perangemin > $parallelenvconf->{$penv}->{'hostqueues'}->{$queue}) {
+                        print STDERR "Skipping $queue because parallel env $penv needs $perangemin slots > " . $parallelenvconf->{$penv}->{'hostqueues'}->{$queue} . "\n" if (defined($opts{'d'}));
+                        next PENV;
+                  }
+                  $thispenvfound = $penvfound = $penv;
+                  print STDERR "Selecting parallel env $penv for $queuehost\n" if (defined($opts{'d'}));
+                  last PENV;
+               }
+               if (!$thispenvfound) {
+                  print STDERR "Skipping host $host because no suitable parallel env found\n" if (defined($opts{'d'}));
+                  next HOST;
+               }
+            }
+
             if (grep(/^$host$/,@blacklist)) {
                #Blacklisted, skip
                print STDERR "Skipping blacklisted host $host\n" if (defined($opts{'d'}));
                next HOST;
-            } elsif ($host eq $lastwake) {
-               print("Giving up on $host, trying the next one.\n");
-   # This isn't working well right now, but the idea is to give up on failing hosts
-   #            open(BL,">> /var/lib/gewake/blacklist");
-   #            print BL "$host\n";
-   #            close(BL);
-               next HOST;
-            } else {
-               # Check hard resources using the appropriate complex method
-               foreach $resource (sort(keys(%hardresource))) {
-                  print STDERR "Checking resource requirement $resource: " if (defined($opts{'d'}));
-                  if (defined($qhresource{$queuehost}->{$resource})) {
-                     my $thishardresource = $hardresource{$resource};
-                     # Booleans are reported as numeric, but can be specified as true/false
-                     $thishardresource =~ s/true/1.000000/;
-                     my $slots = ($jobinfo{$jobid}->{slots} > $qhresource{$queuehost}->{'slots'}) ? $qhresource{$queuehost}->{'slots'} : $jobinfo{$jobid}->{slots};
-                     # TODO - This isn't "MEMORY" per se but consumable "YES" vs "JOB", but possibly only for MEMORY types
-                     #print STDERR "next HOST if !($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $slots" : "") . ") $complex{$resource}->{relop} " . $qhresource{$queuehost}->{$resource} . ")\n" if (defined($opts{'d'}));
-                     print STDERR "next HOST if !($thishardresource) $complex{$resource}->{relop} " . $qhresource{$queuehost}->{$resource} . ")\n" if (defined($opts{'d'}));
-                     if ($complex{$resource}->{'relop'} eq "eq") {
-                        # Need to quote strings
-                        next HOST if eval "!(\"$thishardresource\" $complex{$resource}->{'relop'} \"$qhresource{$queuehost}->{$resource}\") ";
-                     } else {
-                        #next HOST if eval "!(($thishardresource" . (($complex{$resource}->{'type'} eq "MEMORY") ? " * $slots" : "") . ") $complex{$resource}->{'relop'} $qhresource{$queuehost}->{$resource})";
-                        next HOST if eval "!(($thishardresource) $complex{$resource}->{'relop'} $qhresource{$queuehost}->{$resource})";
+            } elsif (defined($lastwake{$host})) {
+               if (!defined($lastwakedecremented{$host})) {
+                  $lastwake{$host}--;
+                  $lastwakedecremented{$host} = 1;
+                  if ($lastwake{$host} <= 0) {
+                     print("Giving up on $host, trying the next one.\n");
+                     delete $lastwake{$host};
+                     # This isn't working well right now, but the idea is to give up on failing hosts
+                     if (!defined($opts{'d'})) {
+                        open(BL,">> /var/lib/gewake/blacklist");
+                        print BL "$host\n";
+                        close(BL);
                      }
                   } else {
-                     next HOST;
+                     print STDERR "Still waiting on $host for job $jobid - $lastwake{$host} more times\n"; # if (defined($opts{'d'}));
                   }
                }
-
-               # Handle parallel environment requests
-               if ($parallelenv ne "") {
-                  if ($parallelalloc eq '$pe_slots') {
-                     if ($perangemin > $qhresource{$queuehost}->{"slots"}) {
-                        print STDERR "Skipping $host because parallel env $parallelenv needs $perangemin slots > " . $qhresource{$queuehost}->{"slots"} . "\n" if (defined($opts{'d'}));
-                        next HOST;
-                     }
-                  }
-                  my @parallelenvs = keys(%$parallelenvconf);
-                  @parallelenvs = ($penvfound) if $penvfound;
-                  my $thispenvfound = 0;
-                  PENV: foreach my $penv (@parallelenvs) {
-                     print STDERR "Checking parallel env $penv for $queuehost\n" if (defined($opts{'d'}));
-                     if (!defined($parallelenvconf->{$penv}->{'hostqueues'}->{$queuehost})) {
-                           print STDERR "Skipping $queuehost because it does not contain parallel env $penv\n" if (defined($opts{'d'}));
-                           next PENV;
-                     } elsif ($perangemin > $parallelenvconf->{$penv}->{'hostqueues'}->{$queue}) {
-                           print STDERR "Skipping $queue because parallel env $penv needs $perangemin slots > " . $parallelenvconf->{$penv}->{'hostqueues'}->{$queue} . "\n" if (defined($opts{'d'}));
-                           next PENV;
-                     }
-                     $thispenvfound = $penvfound = $penv;
-                     print STDERR "Selecting parallel env $penv for $queuehost\n" if (defined($opts{'d'}));
-                     last PENV;
-                  }
-                  if (!$thispenvfound) {
-                     print STDERR "Skipping host $host because no suitable parallel env found\n" if (defined($opts{'d'}));
-                     next HOST;
-                  }
-               }
-
+            } else {
                print("Queing wake up of $host for jobid $jobid on queue $queue,") if defined($opts{'d'});
                print(" pe = $penvfound,") if $penvfound and defined($opts{'d'});
                print(" slots = ". $qhresource{$queuehost}->{"slots"} . ", status = " . $status{$queuehost} . ", slots needed = $slotsneeded\n") if defined($opts{'d'});
@@ -530,18 +552,15 @@ JOB: foreach $jobid (@waiting) {
                   print(" setting holdneeded\n") if defined($opts{'d'});
                   $holdneeded = 1;
                }
-
-               # Reduce the slots needed by the slots provided by this host
-               $slotsneeded -= $qhresource{$queuehost}->{"slots"};
-               $jobslotsneeded -= $qhresource{$queuehost}->{"slots"};
-               print("slots needed = $slotsneeded, jobslotsneeded = $jobslotsneeded\n") if (defined($opts{'d'}));
-
-               # Stop looking for hosts if we have enough for this job
-               last HOST if $jobslotsneeded <= 0;
-
-               # Avoid any other queues on this host
-               next HOST;
             }
+
+            # Reduce the slots needed by the slots provided by this host
+            $slotsneeded -= $qhresource{$queuehost}->{"slots"};
+            $jobslotsneeded -= $qhresource{$queuehost}->{"slots"};
+            print("slots needed = $slotsneeded, jobslotsneeded = $jobslotsneeded\n") if (defined($opts{'d'}));
+
+            # Stop looking for hosts if we have enough for this job
+            last HOST if $jobslotsneeded <= 0;
          }
       }
    }
@@ -549,15 +568,13 @@ JOB: foreach $jobid (@waiting) {
    # If we are not a parallel job, or if we can wake up enough hosts, or if we just want as many as possible...
    if ($parallelenv eq "" or $jobslotsneeded <= 0 or $jobslotsneeded > 9000000) {
       HOST: foreach $host (@hostsToWake) {
-         print("Waking up $host\n") if ($jobinfo{$jobid}->{"user"} ne "root");
+         print("Waking up $host for job $jobid\n") if ($jobinfo{$jobid}->{"user"} ne "root");
          system("$wakeupcmd $host") unless defined($opts{'d'});
          $woke++;
          push(@wokenhosts,$host);
 
-         # Record that last host woken up
-         open(LAST,"> /var/lib/gewake/last") or die;
-         print LAST "$host\n";
-         close(LAST);
+         # Start the wake up host counter
+         $lastwake{$host} = $wakeupHostsWait{$host};
 
          # Sleep a bit to stagger power ups
          sleep(5);
@@ -569,6 +586,15 @@ JOB: foreach $jobid (@waiting) {
    # Place a job hold if waking up multiple hosts
    if ($holdneeded and $woke > 1) {
       print("Placing hold on $jobid: ");
-      system("qhold -o u $jobid");
+      system("qhold -o u $jobid") unless defined($opts{'d'});
    }
+}
+
+# Record that last host(s) woken up
+if (%lastwake and !defined($opts{'d'})) {
+   open(LAST,"> /var/lib/gewake/last") or die;
+   foreach $host (sort(keys(%lastwake))) {
+      print LAST "$host $lastwake{$host}\n";
+   }
+   close(LAST);
 }
