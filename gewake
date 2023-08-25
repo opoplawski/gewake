@@ -110,7 +110,7 @@ sub loadParallelEnvs {
    return \%envconf;
 }
 
-my $version = "1.8";
+my $version = "1.9";
 my $wakehostsfile = "/usr/local/etc/gewake.hosts";
 my $wakeupcmd = "/usr/local/bin/wakeup";
 my %status = ();
@@ -398,11 +398,7 @@ JOB: foreach $jobid (@waiting) {
             print "status{$queue} = $status\n" if (defined($opts{'d'}));
             next QSTATLINE;
          } elsif (($queue) = /has no permission for cluster queue "(.+)"/) {
-            # Strip domain
-            $queue =~ s/\.[^@]*$//;
-
-            # Set the status if it isn't already "up"
-            $status{$queue} = "noaccess" unless defined($status{$queue});
+            $status{$queue} = "noperm";
 
             # Debug
             print "status{$queue} = $status{$queue}\n" if (defined($opts{'d'}));
@@ -451,6 +447,12 @@ JOB: foreach $jobid (@waiting) {
                print "Skipping $queuehost not in hardqueuelist " . join(",",@hardqueuelist) . "\n" if (defined($opts{'d'}));
                next QUEUE;
             }
+         }
+
+         # Skip queue if no permission
+         if (defined($status{$queue}) and $status{$queue} eq "noperm") {
+            print "Skipping $queuehost no permission for $queue\n" if (defined($opts{'d'}));
+            next QUEUE;
          }
 
          # Skip queue if it is the wrong type
